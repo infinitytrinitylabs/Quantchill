@@ -1,3 +1,5 @@
+import { AvatarMetadata } from './QuantneonAvatarService';
+
 export interface InterestGraph {
   [interest: string]: number;
 }
@@ -13,10 +15,23 @@ export interface BCIContext {
   dopamineIndex?: number;
 }
 
+/** Direction of a hologram swipe gesture in the 3D swipe UI. */
+export type SwipeDirection = 'left' | 'right';
+
+/** Recorded outcome when a user swipes a matched candidate's hologram. */
+export interface SwipeAction {
+  userId: string;
+  candidateId: string;
+  direction: SwipeDirection;
+  recordedAt: number;
+}
+
 export interface MatchResult {
   candidate: UserProfile;
   score: number;
   shouldTransitionLoop: boolean;
+  /** 3D avatar metadata fetched from Quantneon for the hologram swipe UI. */
+  avatar?: AvatarMetadata;
 }
 
 export class MatchMaker {

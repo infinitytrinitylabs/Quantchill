@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { MatchMaker, UserProfile } from '../src/services/MatchMaker';
+import { MatchMaker, UserProfile, SwipeAction } from '../src/services/MatchMaker';
 
 test('MatchMaker ranks candidates by interest graph compatibility', () => {
   const matchMaker = new MatchMaker();
@@ -36,4 +36,27 @@ test('MatchMaker triggers instant loop transition for low engagement', () => {
     matchMaker.shouldTransitionLoop({ eyeTrackingFocus: 60, engagementScore: 40, dopamineIndex: 40 }),
     false
   );
+});
+
+test('SwipeAction type has correct shape for hologram push/pull', () => {
+  const action: SwipeAction = {
+    userId: 'u1',
+    candidateId: 'u2',
+    direction: 'left',
+    recordedAt: Date.now()
+  };
+
+  assert.equal(action.direction, 'left');
+  assert.equal(action.userId, 'u1');
+  assert.equal(action.candidateId, 'u2');
+  assert.ok(typeof action.recordedAt === 'number');
+});
+
+test('SwipeAction direction accepts left (push away) and right (pull closer)', () => {
+  const base = { userId: 'u1', candidateId: 'u2', recordedAt: 0 };
+  const leftSwipe: SwipeAction = { ...base, direction: 'left' };
+  const rightSwipe: SwipeAction = { ...base, direction: 'right' };
+
+  assert.equal(leftSwipe.direction, 'left');
+  assert.equal(rightSwipe.direction, 'right');
 });

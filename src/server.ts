@@ -3,7 +3,8 @@ import websocket from '@fastify/websocket';
 import { randomUUID } from 'node:crypto';
 import { RawData, WebSocket } from 'ws';
 import { BiometricHandshakeService, BiometricPayload } from './services/BiometricHandshakeService';
-import { MatchMaker, UserProfile, BCIContext } from './services/MatchMaker';
+import { MatchMaker, UserProfile, BCIContext, SwipeDirection } from './services/MatchMaker';
+import { QuantneonAvatarService } from './services/QuantneonAvatarService';
 
 type SocketMessage =
   | { type: 'register'; userId: string; interestGraph: Record<string, number>; bciContext?: BCIContext }
@@ -12,6 +13,7 @@ type SocketMessage =
   | { type: 'biometric-handshake'; payload: BiometricPayload }
   | { type: 'biometric-update'; payload: BiometricPayload }
   | { type: 'match-request'; bciContext: BCIContext }
+  | { type: 'swipe-action'; candidateId: string; direction: SwipeDirection }
   | { type: 'ping'; sentAt?: number };
 
 interface ClientState {
@@ -24,6 +26,7 @@ interface ClientState {
 const app = Fastify({ logger: true });
 const handshakeService = new BiometricHandshakeService();
 const matchMaker = new MatchMaker();
+const avatarService = new QuantneonAvatarService();
 const clients = new Map<string, ClientState>();
 
 function sendSafe(socket: WebSocket, payload: unknown): void {
@@ -56,126 +59,163 @@ app.get('/ws', { websocket: true }, (socket) => {
   sendSafe(socket, { type: 'connected', clientId });
 
   socket.on('message', (raw: RawData) => {
-    let message: SocketMessage;
+    void (async () => {
+      let message: SocketMessage;
 
-    try {
-      message = JSON.parse(String(raw)) as SocketMessage;
-    } catch {
-      sendSafe(socket, { type: 'error', message: 'invalid-json' });
-      return;
-    }
-
-    const currentClient = clients.get(clientId);
-    if (!currentClient) {
-      return;
-    }
-
-    if (message.type === 'biometric-handshake') {
-      const valid = handshakeService.validateInitialHandshake(message.payload);
-      if (!valid) {
-        terminateClient(clientId, 'biometric-handshake-failed');
+      try {
+        message = JSON.parse(String(raw)) as SocketMessage;
+      } catch {
+        sendSafe(socket, { type: 'error', message: 'invalid-json' });
         return;
       }
 
-      currentClient.authenticated = true;
-      sendSafe(socket, { type: 'biometric-handshake-accepted', acceptedAt: Date.now() });
-      return;
-    }
-
-    if (!currentClient.authenticated) {
-      sendSafe(socket, { type: 'error', message: 'biometric-handshake-required' });
-      return;
-    }
-
-    if (message.type === 'biometric-update') {
-      if (handshakeService.shouldTerminateForLiveness(message.payload)) {
-        terminateClient(clientId, 'face-liveness-dropped');
+      const currentClient = clients.get(clientId);
+      if (!currentClient) {
         return;
       }
 
-      sendSafe(socket, { type: 'biometric-ok', checkedAt: Date.now() });
-      return;
-    }
+      if (message.type === 'biometric-handshake') {
+        const valid = handshakeService.validateInitialHandshake(message.payload);
+        if (!valid) {
+          terminateClient(clientId, 'biometric-handshake-failed');
+          return;
+        }
 
-    if (message.type === 'register') {
-      currentClient.profile = {
-        id: message.userId,
-        interestGraph: message.interestGraph
-      };
-
-      sendSafe(socket, { type: 'registered', userId: message.userId });
-      return;
-    }
-
-    if (message.type === 'match-request') {
-      if (!currentClient.profile) {
-        sendSafe(socket, { type: 'error', message: 'register-required' });
+        currentClient.authenticated = true;
+        sendSafe(socket, { type: 'biometric-handshake-accepted', acceptedAt: Date.now() });
         return;
       }
 
-      const candidates = Array.from(clients.values())
-        .filter((client) => client.authenticated && client.profile)
-        .map((client) => client.profile as UserProfile);
-
-      const ranked = matchMaker.rankCandidates(currentClient.profile, candidates, message.bciContext);
-      sendSafe(socket, {
-        type: 'match-response',
-        transitionLoop: matchMaker.shouldTransitionLoop(message.bciContext),
-        candidates: ranked.slice(0, 5)
-      });
-      return;
-    }
-
-    if (message.type === 'offer' || message.type === 'answer' || message.type === 'ice-candidate') {
-      const target = Array.from(clients.values()).find((client) => client.profile?.id === message.targetUserId);
-      if (!target) {
-        sendSafe(socket, { type: 'error', message: 'target-not-found' });
+      if (!currentClient.authenticated) {
+        sendSafe(socket, { type: 'error', message: 'biometric-handshake-required' });
         return;
       }
 
-      sendSafe(target.socket, {
-        type: message.type,
-        fromUserId: currentClient.profile?.id,
-        payload: message.payload,
-        relayedAt: Date.now()
-      });
+      if (message.type === 'biometric-update') {
+        if (handshakeService.shouldTerminateForLiveness(message.payload)) {
+          terminateClient(clientId, 'face-liveness-dropped');
+          return;
+        }
 
-      return;
-    }
-
-    if (message.type === 'swap-video') {
-      const startedAt = message.startedAt ?? Date.now();
-      const now = Date.now();
-      const relayLatencyMs = Math.max(0, now - startedAt);
-      const target = Array.from(clients.values()).find((client) => client.profile?.id === message.targetUserId);
-
-      if (!target) {
-        sendSafe(socket, { type: 'error', message: 'target-not-found' });
+        sendSafe(socket, { type: 'biometric-ok', checkedAt: Date.now() });
         return;
       }
 
-      sendSafe(target.socket, {
-        type: 'swap-video',
-        fromUserId: currentClient.profile?.id,
-        requestId: message.requestId ?? randomUUID(),
-        startedAt,
-        relayedAt: now,
-        relayLatencyMs,
-        under200ms: relayLatencyMs < 200
-      });
+      if (message.type === 'register') {
+        currentClient.profile = {
+          id: message.userId,
+          interestGraph: message.interestGraph
+        };
 
-      sendSafe(socket, {
-        type: 'swap-video-ack',
-        requestId: message.requestId,
-        relayLatencyMs,
-        under200ms: relayLatencyMs < 200
-      });
-      return;
-    }
+        sendSafe(socket, { type: 'registered', userId: message.userId });
+        return;
+      }
 
-    if (message.type === 'ping') {
-      sendSafe(socket, { type: 'pong', sentAt: message.sentAt ?? Date.now(), receivedAt: Date.now() });
-    }
+      if (message.type === 'match-request') {
+        if (!currentClient.profile) {
+          sendSafe(socket, { type: 'error', message: 'register-required' });
+          return;
+        }
+
+        const candidates = Array.from(clients.values())
+          .filter((client) => client.authenticated && client.profile)
+          .map((client) => client.profile as UserProfile);
+
+        const ranked = matchMaker.rankCandidates(currentClient.profile, candidates, message.bciContext);
+        const top = ranked.slice(0, 5);
+
+        // Attach Quantneon 3D avatar metadata so the client can render hologram swipe cards.
+        const withAvatars = await Promise.all(
+          top.map(async (result) => ({
+            ...result,
+            avatar: await avatarService.getAvatar(result.candidate.id)
+          }))
+        );
+
+        sendSafe(socket, {
+          type: 'match-response',
+          transitionLoop: matchMaker.shouldTransitionLoop(message.bciContext),
+          candidates: withAvatars
+        });
+        return;
+      }
+
+      if (message.type === 'swipe-action') {
+        if (!currentClient.profile) {
+          sendSafe(socket, { type: 'error', message: 'register-required' });
+          return;
+        }
+
+        const { candidateId, direction } = message;
+        if (direction !== 'left' && direction !== 'right') {
+          sendSafe(socket, { type: 'error', message: 'invalid-swipe-direction' });
+          return;
+        }
+
+        sendSafe(socket, {
+          type: 'swipe-action-ack',
+          userId: currentClient.profile.id,
+          candidateId,
+          direction,
+          recordedAt: Date.now()
+        });
+        return;
+      }
+
+      if (message.type === 'offer' || message.type === 'answer' || message.type === 'ice-candidate') {
+        const target = Array.from(clients.values()).find((client) => client.profile?.id === message.targetUserId);
+        if (!target) {
+          sendSafe(socket, { type: 'error', message: 'target-not-found' });
+          return;
+        }
+
+        sendSafe(target.socket, {
+          type: message.type,
+          fromUserId: currentClient.profile?.id,
+          payload: message.payload,
+          relayedAt: Date.now()
+        });
+
+        return;
+      }
+
+      if (message.type === 'swap-video') {
+        const startedAt = message.startedAt ?? Date.now();
+        const now = Date.now();
+        const relayLatencyMs = Math.max(0, now - startedAt);
+        const target = Array.from(clients.values()).find((client) => client.profile?.id === message.targetUserId);
+
+        if (!target) {
+          sendSafe(socket, { type: 'error', message: 'target-not-found' });
+          return;
+        }
+
+        sendSafe(target.socket, {
+          type: 'swap-video',
+          fromUserId: currentClient.profile?.id,
+          requestId: message.requestId ?? randomUUID(),
+          startedAt,
+          relayedAt: now,
+          relayLatencyMs,
+          under200ms: relayLatencyMs < 200
+        });
+
+        sendSafe(socket, {
+          type: 'swap-video-ack',
+          requestId: message.requestId,
+          relayLatencyMs,
+          under200ms: relayLatencyMs < 200
+        });
+        return;
+      }
+
+      if (message.type === 'ping') {
+        sendSafe(socket, { type: 'pong', sentAt: message.sentAt ?? Date.now(), receivedAt: Date.now() });
+      }
+    })().catch((err: unknown) => {
+      app.log.error({ err }, 'unhandled error in message handler');
+      sendSafe(socket, { type: 'error', message: 'internal-error' });
+    });
   });
 
   socket.on('close', () => {
