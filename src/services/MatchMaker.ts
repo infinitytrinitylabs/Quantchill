@@ -40,11 +40,7 @@ export interface MatchResponse {
 }
 
 export class MatchMaker {
-  constructor(
-    private readonly lowEngagementThreshold = 40,
-    private readonly attentionDecayThreshold = 0.3,
-    private readonly quantsinkVipBoost = 35
-  ) {}
+  constructor(private readonly lowEngagementThreshold = 40, private readonly attentionDecayThreshold = 0.3) {}
 
   rankCandidates(user: UserProfile, candidates: UserProfile[], context: BCIContext): MatchResult[] {
     const prioritizeVip = this.shouldEscalateToPriorityFeed(context);
@@ -53,7 +49,7 @@ export class MatchMaker {
       .filter((candidate) => candidate.id !== user.id)
       .map((candidate) => ({
         candidate,
-        score: this.calculateCompatibility(user.interestGraph, candidate.interestGraph, context, candidate),
+        score: this.calculateCompatibility(user.interestGraph, candidate.interestGraph, context),
         shouldTransitionLoop: this.shouldTransitionLoop(context)
       }))
       .sort((a, b) => {
@@ -92,7 +88,7 @@ export class MatchMaker {
             mode: 'standard',
             reason: 'interest-match',
             attentionDecay: context.attentionDecay ?? null,
-            usedCachedFeed: true
+            usedCachedFeed: false
           }
     };
   }
@@ -108,8 +104,7 @@ export class MatchMaker {
   private calculateCompatibility(
     source: InterestGraph,
     target: InterestGraph,
-    context: BCIContext,
-    candidate?: UserProfile
+    context: BCIContext
   ): number {
     const keys = new Set([...Object.keys(source), ...Object.keys(target)]);
     let overlapScore = 0;
@@ -126,9 +121,7 @@ export class MatchMaker {
     const graphSimilarity = totalWeight === 0 ? 0 : (overlapScore / totalWeight) * 100;
     const focusBoost = Math.min(1, Math.max(0, context.eyeTrackingFocus / 100)) * 15;
     const dopamineBoost = Math.min(1, Math.max(0, (context.dopamineIndex ?? 50) / 100)) * 10;
-    const quantsinkVipBoost =
-      this.shouldEscalateToPriorityFeed(context) && candidate?.quantsinkFeed?.isVip ? this.quantsinkVipBoost : 0;
 
-    return Number((graphSimilarity + focusBoost + dopamineBoost + quantsinkVipBoost).toFixed(2));
+    return Number((graphSimilarity + focusBoost + dopamineBoost).toFixed(2));
   }
 }

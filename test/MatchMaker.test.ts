@@ -38,6 +38,20 @@ test('MatchMaker triggers instant loop transition for low engagement', () => {
   );
 });
 
+test('MatchMaker transitions loop for low attention decay even when engagement stays high', () => {
+  const matchMaker = new MatchMaker();
+
+  assert.equal(
+    matchMaker.shouldTransitionLoop({
+      eyeTrackingFocus: 60,
+      engagementScore: 70,
+      dopamineIndex: 40,
+      attentionDecay: 0.25
+    }),
+    true
+  );
+});
+
 test('MatchMaker escalates to cached Quantsink VIP routing when attention decay drops below threshold', () => {
   const matchMaker = new MatchMaker();
   const user: UserProfile = {
@@ -103,6 +117,7 @@ test('MatchMaker keeps standard routing when attention decay is not below thresh
   assert.equal(response.shouldTransitionLoop, false);
   assert.equal(response.quantsinkHook.mode, 'standard');
   assert.equal(response.quantsinkHook.reason, 'interest-match');
+  assert.equal(response.quantsinkHook.usedCachedFeed, false);
   assert.equal(response.quantsinkHook.targetUserId, undefined);
   assert.equal(response.candidates[0]?.candidate.id, 'u3');
 });
