@@ -6,7 +6,16 @@ import { BiometricHandshakeService, BiometricPayload } from './services/Biometri
 import { MatchMaker, UserProfile, BCIContext } from './services/MatchMaker';
 
 type SocketMessage =
-  | { type: 'register'; userId: string; interestGraph: Record<string, number>; bciContext?: BCIContext }
+  | {
+      type: 'register';
+      userId: string;
+      interestGraph: Record<string, number>;
+      quantsinkFeed?: {
+        feedId: string;
+        isVip: boolean;
+      };
+      bciContext?: BCIContext;
+    }
   | { type: 'offer' | 'answer' | 'ice-candidate'; targetUserId: string; payload: unknown }
   | { type: 'swap-video'; targetUserId: string; requestId?: string; startedAt?: number }
   | { type: 'biometric-handshake'; payload: BiometricPayload }
@@ -100,7 +109,8 @@ app.get('/ws', { websocket: true }, (socket) => {
     if (message.type === 'register') {
       currentClient.profile = {
         id: message.userId,
-        interestGraph: message.interestGraph
+        interestGraph: message.interestGraph,
+        quantsinkFeed: message.quantsinkFeed
       };
 
       sendSafe(socket, { type: 'registered', userId: message.userId });
@@ -117,11 +127,12 @@ app.get('/ws', { websocket: true }, (socket) => {
         .filter((client) => client.authenticated && client.profile)
         .map((client) => client.profile as UserProfile);
 
-      const ranked = matchMaker.rankCandidates(currentClient.profile, candidates, message.bciContext);
+      const response = matchMaker.createMatchResponse(currentClient.profile, candidates, message.bciContext);
       sendSafe(socket, {
         type: 'match-response',
-        transitionLoop: matchMaker.shouldTransitionLoop(message.bciContext),
-        candidates: ranked.slice(0, 5)
+        transitionLoop: response.shouldTransitionLoop,
+        quantsinkHook: response.quantsinkHook,
+        candidates: response.candidates.slice(0, 5)
       });
       return;
     }
