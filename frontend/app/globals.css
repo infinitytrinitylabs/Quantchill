@@ -1,0 +1,50 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --color-midnight: #0a0a12;
+  --color-deep-space: #0d0d1a;
+  --color-aurora: #6b46c1;
+  --color-aurora-light: #9b6dff;
+  --color-teal: #0e9999;
+  --color-teal-glow: #14cccc;
+  --color-fog: #b0b8d4;
+}
+
+html,
+body {
+  background-color: var(--color-midnight);
+  color: var(--color-fog);
+  font-family: 'Inter', system-ui, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  scroll-behavior: smooth;
+}
+
+/* Scrollbar */
+::-webkit-scrollbar {
+  width: 4px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: #2d2d4a;
+  border-radius: 2px;
+}
+
+/* Glow utilities */
+.glow-aurora {
+  box-shadow: 0 0 24px 4px rgba(107, 70, 193, 0.45);
+}
+.glow-teal {
+  box-shadow: 0 0 24px 4px rgba(14, 153, 153, 0.45);
+}
+.text-glow-aurora {
+  text-shadow: 0 0 16px rgba(155, 109, 255, 0.8);
+}
+.text-glow-teal {
+  text-shadow: 0 0 16px rgba(20, 204, 204, 0.8);
+}
