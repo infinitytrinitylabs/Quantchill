@@ -21,7 +21,7 @@ export default function ChillRoomLobby({ friends }: ChillRoomLobbyProps) {
 
   const handleJoin = async () => {
     setJoining(true);
-    await new Promise<void>((res) => setTimeout(res, 1200));
+    await new Promise<void>((resolve) => setTimeout(resolve, 1200));
     setJoining(false);
     setJoined(true);
   };

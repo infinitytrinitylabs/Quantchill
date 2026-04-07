@@ -46,6 +46,10 @@ function terminateClient(clientId: string, reason: string): void {
   clients.delete(clientId);
 }
 
+function getSessionEngine(sessionId: string): MoodEngine | null {
+  return sessionEngines.get(sessionId) ?? null;
+}
+
 app.register(websocket);
 
 app.get('/health', async () => ({ status: 'ok' }));
@@ -107,7 +111,11 @@ app.post<{
     return reply.status(404).send({ error: 'session-not-found' });
   }
 
-  const engine = sessionEngines.get(request.params.sessionId) ?? new MoodEngine(session.mood);
+  const engine = getSessionEngine(request.params.sessionId);
+  if (!engine) {
+    return reply.status(500).send({ error: 'session-engine-not-found' });
+  }
+
   const track = engine.evolveTrack();
   return { track };
 });
@@ -122,7 +130,11 @@ app.post<{
     return reply.status(404).send({ error: 'session-not-found' });
   }
 
-  const engine = sessionEngines.get(request.params.sessionId) ?? new MoodEngine(session.mood);
+  const engine = getSessionEngine(request.params.sessionId);
+  if (!engine) {
+    return reply.status(500).send({ error: 'session-engine-not-found' });
+  }
+
   const transition = engine.evaluateBCIContext(request.body.bciContext);
   const track = engine.generateTrack();
 
