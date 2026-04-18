@@ -1,389 +1,377 @@
 /**
- * SpeedCallManager – manages the 60-second WebRTC speed-dating call lifecycle.
+ * SpeedCallManager – WebRTC call session manager for 60-second speed dates.
  *
- * Responsibilities (issue #25 §2):
- *  - Hold the authoritative call clock (hard-stop at 60 seconds).
- *  - Emit `tick` events once per second so the UI can drive the countdown
- *    ring on both sides.
- *  - Emit a `warning` event at the 10-second remaining mark.
- *  - At 0 seconds, auto-disconnect with a `call-ended(reason='timer-expired')`.
- *  - Monitor connection quality via ICE-connection-state updates.  If the
- *     WebRTC connection drops, both users are refunded a **re-match token**
- *     that lets them skip their cooldown / keep their place in queue.
- *  - Forward raw WebRTC signaling (offer / answer / ICE) between the two
- *     peers in the pair.
+ * Responsibilities:
+ *  1. Accept a matched pair from SpeedDatingQueue and open a signaling room.
+ *  2. Enforce a hard 60-second call duration; emit `warning` at 10 s remaining.
+ *  3. Auto-disconnect both peers when the timer reaches zero.
+ *  4. Monitor connection quality; issue a re-match token when quality drops to
+ *     `disconnected` before the call ends naturally.
+ *  5. Relay WebRTC offer / answer / ICE-candidate messages between peers.
  *
- * The SpeedCallManager is deliberately transport-agnostic – callers wire
- * the `signal` event to a Fastify WebSocket `send` and call `deliverSignal`
- * with messages received from the peer.
+ * Events emitted:
+ *  - `call-started`     (session: CallSession)
+ *  - `signal`           (msg: SpeedSignalingMessage)    – forwarded SDP/ICE
+ *  - `call-warning`     (sessionId: string, remainingMs: number)
+ *  - `call-ended`       (sessionId: string, reason: CallEndReason)
+ *  - `rematch-token`    (userId: string, token: string)  – one per user on drop
+ *  - `quality-changed`  (sessionId: string, quality: CallQuality)
  */
 
 import { EventEmitter } from 'node:events';
 import { randomUUID } from 'node:crypto';
-import type { NowFn } from './SpeedDatingQueue';
+import type { SpeedMatchPair } from './SpeedDatingQueue';
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
-/** Hard-stop length of a speed-dating call (ms). */
+/** Hard call duration in milliseconds. */
 export const CALL_DURATION_MS = 60_000;
 
-/** Milliseconds before end at which a warning fires (issue spec: 10s). */
-export const WARNING_MS_BEFORE_END = 10_000;
+/** Remaining time at which a warning event is emitted (ms). */
+const WARNING_THRESHOLD_MS = 10_000;
 
-/** Grace period (ms) in which we attempt ICE reconnect before giving up. */
-export const RECONNECT_GRACE_MS = 8_000;
+/** Interval at which quality is re-evaluated (ms). */
+const QUALITY_CHECK_INTERVAL_MS = 5_000;
 
-/** Token lifetime (ms) – 5 minutes to honor a re-match claim. */
-export const REMATCH_TOKEN_TTL_MS = 5 * 60 * 1000;
-
-/** How often the UI-facing countdown tick fires (ms). */
-export const TICK_INTERVAL_MS = 1_000;
+/** Number of consecutive poor-quality checks before treating as disconnected. */
+const DISCONNECT_THRESHOLD = 3;
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
-export type CallPhase = 'setup' | 'connecting' | 'connected' | 'warning' | 'ending' | 'ended';
+/** Connection quality levels reported by the quality monitor. */
+export type CallQuality = 'good' | 'medium' | 'poor' | 'disconnected';
 
+/** Reason a call session ended. */
 export type CallEndReason =
-  | 'timer-expired'
-  | 'user-hangup'
-  | 'connection-lost'
-  | 'reconnect-failed'
-  | 'server-shutdown'
-  | 'error';
+  | 'timer'          // 60 s elapsed
+  | 'user-ended'     // one peer ended the call
+  | 'disconnected';  // quality monitor detected full disconnect
 
-/** Signaling message payload travelling between peers. */
-export interface SpeedCallSignalMessage {
-  callId: string;
-  type: 'offer' | 'answer' | 'ice-candidate' | 'renegotiate';
+/** A WebRTC signaling message relayed by SpeedCallManager. */
+export interface SpeedSignalingMessage {
+  type: 'offer' | 'answer' | 'ice-candidate';
   fromUserId: string;
   toUserId: string;
   payload: unknown;
+  sessionId: string;
 }
 
-/** ICE connection state sampled from `RTCPeerConnection`. */
-export type IceConnectionState =
-  | 'new'
-  | 'checking'
-  | 'connected'
-  | 'completed'
-  | 'failed'
-  | 'disconnected'
-  | 'closed';
-
-/** Per-call quality sample. */
-export interface QualitySample {
+/** Quality report submitted by a peer (e.g. from RTCPeerConnection stats). */
+export interface QualityReport {
+  sessionId: string;
   userId: string;
-  iceState: IceConnectionState;
-  rttMs?: number;
-  packetLossPct?: number;
-  sampledAt: number;
+  quality: CallQuality;
 }
 
-/** Re-match token granted after a connection drop. */
-export interface RematchToken {
-  token: string;
-  userId: string;
-  issuedAt: number;
-  expiresAt: number;
-  reason: CallEndReason;
-}
-
-/** A fully-constructed call. */
-export interface SpeedCallState {
-  callId: string;
-  proposalId: string;
-  userA: string;
-  userB: string;
+/** Public snapshot of an active call session. */
+export interface CallSession {
+  sessionId: string;
+  roomId: string;
+  userAId: string;
+  userBId: string;
   startedAt: number;
   endsAt: number;
-  phase: CallPhase;
-  warned: boolean;
-  quality: {
-    a: QualitySample | null;
-    b: QualitySample | null;
-  };
-  /** Milliseconds of "disconnected" ICE state in the current gap, if any. */
-  currentGapStartedAt: number | null;
+  quality: CallQuality;
 }
 
-/** Arguments to `startCall`. */
-export interface StartCallArgs {
-  proposalId: string;
-  userA: string;
-  userB: string;
-}
-
-/** Hook invoked when the call ends – lets callers persist outcomes. */
-export type CallEndListener = (args: {
-  call: SpeedCallState;
-  reason: CallEndReason;
-  rematchTokens: RematchToken[];
-}) => void;
-
-// ─── Configuration ────────────────────────────────────────────────────────────
-
-export interface SpeedCallManagerConfig {
-  callDurationMs?: number;
-  warningMsBeforeEnd?: number;
-  reconnectGraceMs?: number;
-  rematchTokenTtlMs?: number;
-  tickIntervalMs?: number;
-  nowFn?: NowFn;
+/** Full internal state for an active session. */
+interface SessionState {
+  sessionId: string;
+  pair: SpeedMatchPair;
+  startedAt: number;
+  endsAt: number;
+  callTimer: ReturnType<typeof setTimeout>;
+  warningTimer: ReturnType<typeof setTimeout>;
+  qualityTimer: ReturnType<typeof setInterval>;
+  quality: CallQuality;
+  offerReceived: boolean;
+  answerReceived: boolean;
+  /** Count of consecutive poor-quality reports per userId. */
+  poorCounts: Map<string, number>;
+  ended: boolean;
 }
 
 // ─── SpeedCallManager ─────────────────────────────────────────────────────────
 
+/**
+ * SpeedCallManager maintains the lifecycle of every active 60-second call.
+ *
+ * Construct with an optional `nowFn` for deterministic testing.
+ */
 export class SpeedCallManager extends EventEmitter {
-  private readonly callDurationMs: number;
-  private readonly warningMsBeforeEnd: number;
-  private readonly reconnectGraceMs: number;
-  private readonly rematchTokenTtlMs: number;
-  private readonly tickIntervalMs: number;
-  private readonly nowFn: NowFn;
+  /** Active sessions keyed by sessionId. */
+  private readonly sessions = new Map<string, SessionState>();
 
-  /** Active calls keyed by callId. */
-  private readonly calls = new Map<string, SpeedCallState>();
-  /** userId → callId for constant-time lookup. */
-  private readonly userCallIndex = new Map<string, string>();
-  /** callId → interval handle. */
-  private readonly tickHandles = new Map<string, ReturnType<typeof setInterval>>();
-  /** callId → hard-stop timeout handle. */
-  private readonly hardStopHandles = new Map<string, ReturnType<typeof setTimeout>>();
-  /** callId → reconnect grace timeout handle. */
-  private readonly reconnectHandles = new Map<string, ReturnType<typeof setTimeout>>();
-  /** Issued re-match tokens, indexed by token string. */
-  private readonly rematchTokens = new Map<string, RematchToken>();
+  /** roomId → sessionId (fast lookup from SpeedDatingQueue room ids). */
+  private readonly roomIndex = new Map<string, string>();
 
-  constructor(config: SpeedCallManagerConfig = {}) {
+  /** sessionId → token for lightweight credential verification. */
+  private readonly tokens = new Map<string, string>();
+
+  private readonly nowFn: () => number;
+
+  constructor(nowFn: () => number = Date.now) {
     super();
-    this.callDurationMs = config.callDurationMs ?? CALL_DURATION_MS;
-    this.warningMsBeforeEnd = config.warningMsBeforeEnd ?? WARNING_MS_BEFORE_END;
-    this.reconnectGraceMs = config.reconnectGraceMs ?? RECONNECT_GRACE_MS;
-    this.rematchTokenTtlMs = config.rematchTokenTtlMs ?? REMATCH_TOKEN_TTL_MS;
-    this.tickIntervalMs = config.tickIntervalMs ?? TICK_INTERVAL_MS;
-    this.nowFn = config.nowFn ?? (() => Date.now());
+    this.nowFn = nowFn;
   }
 
-  // ── Public API ──────────────────────────────────────────────────────────
+  // ── Session lifecycle ─────────────────────────────────────────────────────
 
-  /** Begin a new 60-second call.  Both users must be free of any other call. */
-  startCall(args: StartCallArgs): SpeedCallState {
-    if (args.userA === args.userB) {
-      throw new Error('userA and userB cannot be the same user');
-    }
-    if (this.userCallIndex.has(args.userA)) {
-      throw new Error(`user ${args.userA} is already in a call`);
-    }
-    if (this.userCallIndex.has(args.userB)) {
-      throw new Error(`user ${args.userB} is already in a call`);
-    }
-
-    const callId = randomUUID();
+  /**
+   * Open a new call session for a matched pair.
+   *
+   * Schedules the warning timer (at 50 s) and the hard end-of-call timer
+   * (at 60 s).  Returns a `CallSession` snapshot with the session credentials.
+   */
+  startSession(pair: SpeedMatchPair): CallSession {
+    const sessionId = randomUUID();
+    const token = randomUUID();
     const now = this.nowFn();
-    const state: SpeedCallState = {
-      callId,
-      proposalId: args.proposalId,
-      userA: args.userA,
-      userB: args.userB,
+    const endsAt = now + CALL_DURATION_MS;
+
+    const warningTimer = setTimeout(() => {
+      this.emitWarning(sessionId);
+    }, CALL_DURATION_MS - WARNING_THRESHOLD_MS);
+
+    const callTimer = setTimeout(() => {
+      this.endSession(sessionId, 'timer');
+    }, CALL_DURATION_MS);
+
+    const qualityTimer = setInterval(() => {
+      this.checkQualityTimeout(sessionId);
+    }, QUALITY_CHECK_INTERVAL_MS);
+
+    const state: SessionState = {
+      sessionId,
+      pair,
       startedAt: now,
-      endsAt: now + this.callDurationMs,
-      phase: 'connecting',
-      warned: false,
-      quality: { a: null, b: null },
-      currentGapStartedAt: null
+      endsAt,
+      callTimer,
+      warningTimer,
+      qualityTimer,
+      quality: 'good',
+      offerReceived: false,
+      answerReceived: false,
+      poorCounts: new Map([
+        [pair.userA.userId, 0],
+        [pair.userB.userId, 0]
+      ]),
+      ended: false
     };
-    this.calls.set(callId, state);
-    this.userCallIndex.set(args.userA, callId);
-    this.userCallIndex.set(args.userB, callId);
 
-    // Kick off tick driver.
-    const tick = setInterval(() => this.onTick(callId), this.tickIntervalMs);
-    if (typeof tick === 'object' && tick && 'unref' in tick) (tick as { unref: () => void }).unref();
-    this.tickHandles.set(callId, tick);
+    this.sessions.set(sessionId, state);
+    this.roomIndex.set(pair.roomId, sessionId);
+    this.tokens.set(sessionId, token);
 
-    const hardStop = setTimeout(() => this.endCall(callId, 'timer-expired'), this.callDurationMs);
-    if (typeof hardStop === 'object' && hardStop && 'unref' in hardStop) {
-      (hardStop as { unref: () => void }).unref();
-    }
-    this.hardStopHandles.set(callId, hardStop);
-
-    this.emit('call-started', state);
-    return state;
+    const snapshot = this.buildSnapshot(state);
+    this.emit('call-started', snapshot);
+    return snapshot;
   }
 
   /**
-   * Peer relay for WebRTC signaling.  Returns `true` when the message was
-   * forwarded, `false` if the call/pair is not recognised.  The UI is
-   * expected to subscribe to the `signal` event and ship the payload over
-   * its WebSocket to the target user.
+   * End a call session.
+   *
+   * Clears all timers, removes session state, and emits `call-ended`.
+   * Returns false if the session does not exist or was already ended.
    */
-  deliverSignal(msg: SpeedCallSignalMessage): boolean {
-    const call = this.calls.get(msg.callId);
-    if (!call) return false;
-    if (msg.fromUserId === msg.toUserId) return false;
+  endSession(sessionId: string, reason: CallEndReason = 'user-ended'): boolean {
+    const state = this.sessions.get(sessionId);
+    if (!state || state.ended) return false;
 
-    const participants = [call.userA, call.userB];
+    state.ended = true;
+    clearTimeout(state.callTimer);
+    clearTimeout(state.warningTimer);
+    clearInterval(state.qualityTimer);
+
+    this.sessions.delete(sessionId);
+    this.roomIndex.delete(state.pair.roomId);
+    this.tokens.delete(sessionId);
+
+    this.emit('call-ended', sessionId, reason);
+    return true;
+  }
+
+  /**
+   * Relay a WebRTC signaling message between peers in a session.
+   *
+   * Validates sender / recipient membership.  Tracks offer and answer receipt
+   * to confirm that the WebRTC handshake completed.
+   *
+   * @returns true if the message was accepted and forwarded.
+   */
+  relay(msg: SpeedSignalingMessage): boolean {
+    const state = this.sessions.get(msg.sessionId);
+    if (!state || state.ended) return false;
+
+    const { userA, userB } = state.pair;
+    const participants = [userA.userId, userB.userId];
+
     if (!participants.includes(msg.fromUserId)) return false;
     if (!participants.includes(msg.toUserId)) return false;
+    if (msg.fromUserId === msg.toUserId) return false;
 
-    // First time we see an offer/answer, mark the call as "connected".
-    if (call.phase === 'connecting' && (msg.type === 'offer' || msg.type === 'answer')) {
-      call.phase = 'connected';
-      this.emit('call-connected', call);
-    }
+    if (msg.type === 'offer') state.offerReceived = true;
+    if (msg.type === 'answer') state.answerReceived = true;
+
     this.emit('signal', msg);
     return true;
   }
 
-  /** Update per-peer quality statistics.  Handles drop/recover transitions. */
-  reportQuality(sample: QualitySample): void {
-    const callId = this.userCallIndex.get(sample.userId);
-    if (!callId) return;
-    const call = this.calls.get(callId);
-    if (!call) return;
+  /**
+   * Accept a quality report from a peer.
+   *
+   * If both peers report `disconnected` consecutively, the call is ended early
+   * and each user receives a re-match token.
+   */
+  reportQuality(report: QualityReport): void {
+    const state = this.sessions.get(report.sessionId);
+    if (!state || state.ended) return;
 
-    const which: 'a' | 'b' = sample.userId === call.userA ? 'a' : 'b';
-    call.quality[which] = sample;
+    const { userA, userB } = state.pair;
+    const participants = [userA.userId, userB.userId];
+    if (!participants.includes(report.userId)) return;
 
-    const badStates: IceConnectionState[] = ['disconnected', 'failed'];
-    const isBad = badStates.includes(sample.iceState);
+    // Track consecutive poor/disconnected reports for this user.
+    const prevCount = state.poorCounts.get(report.userId) ?? 0;
+    const newCount =
+      report.quality === 'poor' || report.quality === 'disconnected'
+        ? prevCount + 1
+        : 0;
+    state.poorCounts.set(report.userId, newCount);
 
-    if (isBad && call.currentGapStartedAt == null) {
-      call.currentGapStartedAt = sample.sampledAt;
-      this.emit('quality-degraded', { call, sample });
-      // Give the connection `reconnectGraceMs` to recover.
-      const handle = setTimeout(() => this.endCall(callId, 'reconnect-failed'), this.reconnectGraceMs);
-      if (typeof handle === 'object' && handle && 'unref' in handle) {
-        (handle as { unref: () => void }).unref();
-      }
-      this.reconnectHandles.set(callId, handle);
-    } else if (!isBad && call.currentGapStartedAt != null) {
-      // Recovered – cancel the pending disconnect.
-      const handle = this.reconnectHandles.get(callId);
-      if (handle) clearTimeout(handle);
-      this.reconnectHandles.delete(callId);
-      call.currentGapStartedAt = null;
-      this.emit('quality-recovered', { call, sample });
+    // Update overall session quality to the worse of the two.
+    const otherUserId = report.userId === userA.userId ? userB.userId : userA.userId;
+    const otherCount = state.poorCounts.get(otherUserId) ?? 0;
+
+    const prevQuality = state.quality;
+    state.quality = this.worstQuality(report.quality, this.qualityFromCount(otherCount));
+
+    if (state.quality !== prevQuality) {
+      this.emit('quality-changed', report.sessionId, state.quality);
+    }
+
+    // Both users have been consistently poor / disconnected.
+    if (
+      newCount >= DISCONNECT_THRESHOLD &&
+      otherCount >= DISCONNECT_THRESHOLD &&
+      report.quality === 'disconnected'
+    ) {
+      this.issueRematchTokens(state);
+      this.endSession(report.sessionId, 'disconnected');
     }
   }
 
-  /** Explicit user hang-up.  Ends the call immediately. */
-  hangup(userId: string): boolean {
-    const callId = this.userCallIndex.get(userId);
-    if (!callId) return false;
-    this.endCall(callId, 'user-hangup');
-    return true;
+  /** Verify that a token is valid for a given session. */
+  verifyToken(sessionId: string, token: string): boolean {
+    return this.tokens.get(sessionId) === token;
   }
 
-  /** Force the call to end with an arbitrary reason. */
-  endCall(callId: string, reason: CallEndReason): boolean {
-    const call = this.calls.get(callId);
-    if (!call || call.phase === 'ended') return false;
+  /** Return whether a session is active. */
+  hasSession(sessionId: string): boolean {
+    return this.sessions.has(sessionId);
+  }
 
-    call.phase = 'ended';
-    this.cleanupTimers(callId);
+  /** Look up a sessionId by its originating roomId. */
+  sessionForRoom(roomId: string): string | null {
+    return this.roomIndex.get(roomId) ?? null;
+  }
 
-    this.userCallIndex.delete(call.userA);
-    this.userCallIndex.delete(call.userB);
-    this.calls.delete(callId);
+  /** Return a public snapshot of a session. */
+  getSession(sessionId: string): Readonly<CallSession> | null {
+    const state = this.sessions.get(sessionId);
+    return state ? this.buildSnapshot(state) : null;
+  }
 
-    const rematchTokens: RematchToken[] = [];
-    if (reason === 'connection-lost' || reason === 'reconnect-failed') {
-      rematchTokens.push(this.issueRematchToken(call.userA, reason));
-      rematchTokens.push(this.issueRematchToken(call.userB, reason));
+  /** Number of active sessions. */
+  activeSessionCount(): number {
+    return this.sessions.size;
+  }
+
+  /**
+   * Return remaining call time in milliseconds for a session.
+   * Returns 0 if the session has ended or does not exist.
+   */
+  remainingMs(sessionId: string): number {
+    const state = this.sessions.get(sessionId);
+    if (!state) return 0;
+    return Math.max(0, state.endsAt - this.nowFn());
+  }
+
+  /** Tear down all sessions (useful in tests). */
+  clear(): void {
+    for (const state of this.sessions.values()) {
+      clearTimeout(state.callTimer);
+      clearTimeout(state.warningTimer);
+      clearInterval(state.qualityTimer);
     }
-
-    this.emit('call-ended', { call, reason, rematchTokens });
-    return true;
+    this.sessions.clear();
+    this.roomIndex.clear();
+    this.tokens.clear();
   }
 
-  /** Redeem a re-match token – single-use, expires after TTL. */
-  consumeRematchToken(token: string, userId: string): boolean {
-    const record = this.rematchTokens.get(token);
-    if (!record) return false;
-    if (record.userId !== userId) return false;
-    if (record.expiresAt < this.nowFn()) {
-      this.rematchTokens.delete(token);
-      return false;
-    }
-    this.rematchTokens.delete(token);
-    this.emit('rematch-token-consumed', record);
-    return true;
+  // ── Private helpers ───────────────────────────────────────────────────────
+
+  private emitWarning(sessionId: string): void {
+    const state = this.sessions.get(sessionId);
+    if (!state || state.ended) return;
+    this.emit('call-warning', sessionId, WARNING_THRESHOLD_MS);
   }
 
-  /** Active call state (or null if no such call). */
-  getCall(callId: string): SpeedCallState | null {
-    return this.calls.get(callId) ?? null;
-  }
+  /**
+   * Periodic quality check: if quality has been `disconnected` for the full
+   * quality check interval with no reports, treat it as a drop.
+   */
+  private checkQualityTimeout(sessionId: string): void {
+    const state = this.sessions.get(sessionId);
+    if (!state || state.ended) return;
 
-  /** callId for the given user, or null if they are not in a call. */
-  getCallForUser(userId: string): string | null {
-    return this.userCallIndex.get(userId) ?? null;
-  }
+    if (state.quality !== 'disconnected') return;
 
-  /** Count of active calls on this instance. */
-  activeCallCount(): number {
-    return this.calls.size;
-  }
-
-  /** Iterate over active calls (read-only). */
-  listActiveCalls(): Readonly<SpeedCallState>[] {
-    return [...this.calls.values()];
-  }
-
-  /** Shutdown helper – ends every call gracefully. */
-  shutdown(): void {
-    for (const callId of [...this.calls.keys()]) {
-      this.endCall(callId, 'server-shutdown');
-    }
-    this.rematchTokens.clear();
-    this.emit('shutdown', {});
-  }
-
-  // ── Internals ───────────────────────────────────────────────────────────
-
-  private onTick(callId: string): void {
-    const call = this.calls.get(callId);
-    if (!call || call.phase === 'ended') return;
-
-    const now = this.nowFn();
-    const remaining = Math.max(0, call.endsAt - now);
-
-    if (!call.warned && remaining <= this.warningMsBeforeEnd) {
-      call.warned = true;
-      call.phase = 'warning';
-      this.emit('warning', { call, remaining });
-    }
-
-    this.emit('tick', { call, remaining });
-
-    if (remaining <= 0) {
-      this.endCall(callId, 'timer-expired');
+    // Both users have had zero updates — silent drop.
+    const counts = [...state.poorCounts.values()];
+    if (counts.every((c) => c >= DISCONNECT_THRESHOLD)) {
+      this.issueRematchTokens(state);
+      this.endSession(sessionId, 'disconnected');
     }
   }
 
-  private cleanupTimers(callId: string): void {
-    const tick = this.tickHandles.get(callId);
-    if (tick) clearInterval(tick);
-    this.tickHandles.delete(callId);
-    const hard = this.hardStopHandles.get(callId);
-    if (hard) clearTimeout(hard);
-    this.hardStopHandles.delete(callId);
-    const reconnect = this.reconnectHandles.get(callId);
-    if (reconnect) clearTimeout(reconnect);
-    this.reconnectHandles.delete(callId);
+  /** Issue a re-match token to each participant and emit the events. */
+  private issueRematchTokens(state: SessionState): void {
+    const tokenA = randomUUID();
+    const tokenB = randomUUID();
+    this.emit('rematch-token', state.pair.userA.userId, tokenA);
+    this.emit('rematch-token', state.pair.userB.userId, tokenB);
   }
 
-  private issueRematchToken(userId: string, reason: CallEndReason): RematchToken {
-    const token: RematchToken = {
-      token: randomUUID(),
-      userId,
-      issuedAt: this.nowFn(),
-      expiresAt: this.nowFn() + this.rematchTokenTtlMs,
-      reason
+  /** Map consecutive-poor count to a quality level. */
+  private qualityFromCount(count: number): CallQuality {
+    if (count === 0) return 'good';
+    if (count === 1) return 'medium';
+    if (count === 2) return 'poor';
+    return 'disconnected';
+  }
+
+  /** Return the worse of two quality levels. */
+  private worstQuality(a: CallQuality, b: CallQuality): CallQuality {
+    const rank: Record<CallQuality, number> = {
+      good: 0,
+      medium: 1,
+      poor: 2,
+      disconnected: 3
     };
-    this.rematchTokens.set(token.token, token);
-    this.emit('rematch-token-issued', token);
-    return token;
+    return rank[a] >= rank[b] ? a : b;
+  }
+
+  /** Build a public CallSession snapshot from internal state. */
+  private buildSnapshot(state: SessionState): CallSession {
+    return {
+      sessionId: state.sessionId,
+      roomId: state.pair.roomId,
+      userAId: state.pair.userA.userId,
+      userBId: state.pair.userB.userId,
+      startedAt: state.startedAt,
+      endsAt: state.endsAt,
+      quality: state.quality
+    };
   }
 }

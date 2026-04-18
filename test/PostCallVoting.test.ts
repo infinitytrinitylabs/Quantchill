@@ -1,133 +1,318 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {
-  PostCallVoting,
-  InMemoryChemistryStore,
-  scoreMatch,
-  type BallotSnapshot
+import { PostCallVoting, VOTING_WINDOW_MS } from '../src/services/PostCallVoting';
+import type {
+  MutualMatchResult,
+  FomoNotification,
+  VotingResult,
+  VoteRecord
 } from '../src/services/PostCallVoting';
 
-function fakeClock(start = 1_700_000_000_000): { now: () => number; advance: (ms: number) => void } {
-  let t = start;
-  return { now: () => t, advance: (ms) => { t += ms; } };
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+
+const FROZEN = new Date('2024-01-01T12:00:00Z').getTime();
+
+function makeVoting(nowFn?: () => number): PostCallVoting {
+  return new PostCallVoting(nowFn ?? (() => FROZEN));
 }
 
-function open(): { v: PostCallVoting; ballot: BallotSnapshot; store: InMemoryChemistryStore; clock: ReturnType<typeof fakeClock> } {
-  const store = new InMemoryChemistryStore();
-  const clock = fakeClock();
-  const v = new PostCallVoting({ store, nowFn: clock.now });
-  const ballot = v.openBallot({ callId: 'call1', userA: 'a', userB: 'b', callDurationMs: 60_000 });
-  return { v, ballot, store, clock };
-}
+// ─── openVoting ───────────────────────────────────────────────────────────────
 
-test('openBallot creates a ballot scoped to two users', () => {
-  const { v, ballot } = open();
-  assert.equal(ballot.userA, 'a');
-  assert.equal(ballot.userB, 'b');
-  assert.equal(v.openBallotCount(), 1);
+test('PostCallVoting openVoting returns the sessionId', () => {
+  const v = makeVoting();
+  const id = v.openVoting('session-1', 'alice', 'bob');
+  assert.equal(id, 'session-1');
 });
 
-test('openBallot rejects duplicate callId and identical users', () => {
-  const { v } = open();
-  assert.throws(() => v.openBallot({ callId: 'call1', userA: 'a', userB: 'b', callDurationMs: 60_000 }));
-  assert.throws(() => v.openBallot({ callId: 'call2', userA: 'x', userB: 'x', callDurationMs: 60_000 }));
+test('PostCallVoting openVoting marks session as open', () => {
+  const v = makeVoting();
+  v.openVoting('session-1', 'alice', 'bob');
+  assert.equal(v.isOpen('session-1'), true);
 });
 
-test('both hearts → mutual-match, chatRoomId, persisted', () => {
-  const { v, store } = open();
-  let mutual: unknown = null;
-  v.on('mutual-match', (e) => { mutual = e; });
-  v.vote('a', 'heart');
-  v.vote('b', 'heart');
-  assert.ok(mutual);
-  assert.equal(store.count(), 1);
-  const record = store.load('call1')!;
-  assert.equal(record.outcome.kind, 'mutual-match');
-  assert.ok(record.outcome.chatRoomId);
+test('PostCallVoting openVoting throws on duplicate sessionId', () => {
+  const v = makeVoting();
+  v.openVoting('session-1', 'alice', 'bob');
+  assert.throws(() => v.openVoting('session-1', 'alice', 'bob'), /already open/);
 });
 
-test('heart + skip produces a FOMO notification to the skip-caster', () => {
-  const { v } = open();
-  let fomo: { notifyUserId: string; fromUserId: string } | null = null;
-  v.on('fomo-notification', (e) => { fomo = e; });
-  v.vote('a', 'heart');
-  v.vote('b', 'skip');
-  assert.ok(fomo);
-  assert.equal(fomo!.notifyUserId, 'b');
-  assert.equal(fomo!.fromUserId, 'a');
+test('PostCallVoting isOpen returns false for unknown session', () => {
+  const v = makeVoting();
+  assert.equal(v.isOpen('unknown'), false);
 });
 
-test('double skip produces no match and no FOMO', () => {
-  const { v, store } = open();
-  let fomo = false;
-  v.on('fomo-notification', () => { fomo = true; });
-  v.vote('a', 'skip');
-  v.vote('b', 'skip');
-  assert.equal(fomo, false);
-  assert.equal(store.load('call1')!.outcome.kind, 'double-skip');
+// ─── castVote ─────────────────────────────────────────────────────────────────
+
+test('PostCallVoting castVote returns a VoteRecord', () => {
+  const v = makeVoting();
+  v.openVoting('s1', 'alice', 'bob');
+  const rec = v.castVote('s1', 'alice', 'heart');
+  assert.equal(rec.sessionId, 's1');
+  assert.equal(rec.userId, 'alice');
+  assert.equal(rec.vote, 'heart');
+  assert.equal(rec.castAt, FROZEN);
 });
 
-test('timeout with no votes closes with timeout-no-votes outcome', async () => {
-  const store = new InMemoryChemistryStore();
-  const v = new PostCallVoting({ store, votingWindowMs: 30 });
-  v.openBallot({ callId: 'c', userA: 'a', userB: 'b', callDurationMs: 60_000 });
-  await new Promise((r) => setTimeout(r, 70));
-  const rec = store.load('c');
-  assert.ok(rec);
-  assert.equal(rec!.outcome.kind, 'timeout-no-votes');
+test('PostCallVoting castVote emits vote-cast', (t, done) => {
+  const v = makeVoting();
+  v.openVoting('s1', 'alice', 'bob');
+  v.once('vote-cast', (rec: VoteRecord) => {
+    assert.equal(rec.userId, 'alice');
+    done();
+  });
+  v.castVote('s1', 'alice', 'next');
 });
 
-test('timeout with one heart still emits FOMO for the absent voter', async () => {
-  const store = new InMemoryChemistryStore();
-  const v = new PostCallVoting({ store, votingWindowMs: 30 });
-  v.openBallot({ callId: 'c', userA: 'a', userB: 'b', callDurationMs: 60_000 });
-  let fomo = false;
-  v.on('fomo-notification', () => { fomo = true; });
-  v.vote('a', 'heart');
-  await new Promise((r) => setTimeout(r, 70));
-  assert.equal(fomo, true);
+test('PostCallVoting castVote throws for unknown session', () => {
+  const v = makeVoting();
+  assert.throws(() => v.castVote('nope', 'alice', 'heart'), /No open voting session/);
 });
 
-test('re-voting the same ballot throws', () => {
-  const { v } = open();
-  v.vote('a', 'heart');
-  assert.throws(() => v.vote('a', 'skip'));
+test('PostCallVoting castVote throws for non-participant', () => {
+  const v = makeVoting();
+  v.openVoting('s1', 'alice', 'bob');
+  assert.throws(() => v.castVote('s1', 'charlie', 'heart'), /not a participant/);
 });
 
-test('voting after close throws', () => {
-  const { v } = open();
-  v.close('call1', 'abandoned');
-  assert.throws(() => v.vote('a', 'heart'));
+test('PostCallVoting castVote throws on double vote', () => {
+  const v = makeVoting();
+  v.openVoting('s1', 'alice', 'bob');
+  v.castVote('s1', 'alice', 'heart');
+  assert.throws(() => v.castVote('s1', 'alice', 'next'), /already voted/);
 });
 
-test('shutdown closes all ballots as abandoned', () => {
-  const { v, store } = open();
-  v.shutdown();
-  assert.equal(store.count(), 1);
+// ─── Mutual match ─────────────────────────────────────────────────────────────
+
+test('PostCallVoting mutual match emits mutual-match event', (t, done) => {
+  const v = makeVoting();
+  v.openVoting('s1', 'alice', 'bob');
+  v.once('mutual-match', (result: MutualMatchResult) => {
+    assert.equal(result.sessionId, 's1');
+    assert.equal(result.userAId, 'alice');
+    assert.equal(result.userBId, 'bob');
+    assert.ok(typeof result.chatRoomId === 'string' && result.chatRoomId.length > 0);
+    done();
+  });
+  v.castVote('s1', 'alice', 'heart');
+  v.castVote('s1', 'bob', 'heart');
 });
 
-test('scoreMatch rewards fast decisions and long calls', () => {
-  const a = { userId: 'a', choice: 'heart' as const, castAt: 1000 };
-  const b = { userId: 'b', choice: 'heart' as const, castAt: 1200 };
-  const fast = scoreMatch(a, b, 60_000);
-  const slow = scoreMatch(a, { ...b, castAt: 10_000 }, 60_000);
-  const short = scoreMatch(a, b, 10_000);
-  assert.ok(fast > slow);
-  assert.ok(fast > short);
-  assert.ok(fast <= 1);
-  assert.ok(short >= 0);
+test('PostCallVoting mutual match outcome stored in history', () => {
+  const v = makeVoting();
+  v.openVoting('s1', 'alice', 'bob');
+  v.castVote('s1', 'alice', 'heart');
+  v.castVote('s1', 'bob', 'heart');
+  const result = v.getResult('s1');
+  assert.ok(result !== null);
+  assert.equal(result!.outcome, 'mutual-match');
 });
 
-test('getBallotForUser returns current or null', () => {
-  const { v } = open();
-  assert.ok(v.getBallotForUser('a'));
-  v.close('call1', 'abandoned');
-  assert.equal(v.getBallotForUser('a'), null);
+test('PostCallVoting mutual match closes session immediately', () => {
+  const v = makeVoting();
+  v.openVoting('s1', 'alice', 'bob');
+  v.castVote('s1', 'alice', 'heart');
+  v.castVote('s1', 'bob', 'heart');
+  assert.equal(v.isOpen('s1'), false);
 });
 
-test('matchScore > 0 only for mutual-match', () => {
-  const { v, store } = open();
-  v.vote('a', 'heart');
-  v.vote('b', 'skip');
-  assert.equal(store.load('call1')!.outcome.matchScore, 0);
+// ─── One-sided (FOMO) ─────────────────────────────────────────────────────────
+
+test('PostCallVoting one-sided emits fomo-notification to skipping user', (t, done) => {
+  const v = makeVoting();
+  v.openVoting('s1', 'alice', 'bob');
+  v.once('fomo-notification', (notif: FomoNotification) => {
+    // Bob skipped, so he is the recipient.
+    assert.equal(notif.recipientId, 'bob');
+    assert.equal(notif.admirerId, 'alice');
+    assert.ok(notif.message.length > 0);
+    done();
+  });
+  v.castVote('s1', 'alice', 'heart');
+  v.castVote('s1', 'bob', 'next');
+});
+
+test('PostCallVoting one-sided (B hearts, A skips) notifies A', (t, done) => {
+  const v = makeVoting();
+  v.openVoting('s1', 'alice', 'bob');
+  v.once('fomo-notification', (notif: FomoNotification) => {
+    assert.equal(notif.recipientId, 'alice');
+    assert.equal(notif.admirerId, 'bob');
+    done();
+  });
+  v.castVote('s1', 'alice', 'next');
+  v.castVote('s1', 'bob', 'heart');
+});
+
+test('PostCallVoting one-sided outcome stored correctly', () => {
+  const v = makeVoting();
+  v.openVoting('s1', 'alice', 'bob');
+  v.castVote('s1', 'alice', 'heart');
+  v.castVote('s1', 'bob', 'next');
+  const result = v.getResult('s1');
+  assert.equal(result!.outcome, 'one-sided');
+  assert.equal(result!.voteA, 'heart');
+  assert.equal(result!.voteB, 'next');
+});
+
+// ─── Both skip ────────────────────────────────────────────────────────────────
+
+test('PostCallVoting both-skipped outcome stores correctly', () => {
+  const v = makeVoting();
+  v.openVoting('s1', 'alice', 'bob');
+  v.castVote('s1', 'alice', 'next');
+  v.castVote('s1', 'bob', 'next');
+  const result = v.getResult('s1');
+  assert.equal(result!.outcome, 'both-skipped');
+});
+
+test('PostCallVoting both-skip does NOT emit mutual-match', () => {
+  const v = makeVoting();
+  v.openVoting('s1', 'alice', 'bob');
+  let fired = false;
+  v.once('mutual-match', () => { fired = true; });
+  v.castVote('s1', 'alice', 'next');
+  v.castVote('s1', 'bob', 'next');
+  assert.equal(fired, false);
+});
+
+// ─── Timeout ──────────────────────────────────────────────────────────────────
+
+test('PostCallVoting timeout closes session and emits voting-closed', (t, done) => {
+  const v = new PostCallVoting();
+  v.openVoting('s-timeout', 'alice', 'bob');
+  v.once('voting-closed', (sessionId: string) => {
+    assert.equal(sessionId, 's-timeout');
+    assert.equal(v.isOpen('s-timeout'), false);
+    done();
+  });
+}, { timeout: VOTING_WINDOW_MS + 2000 });
+
+test('PostCallVoting timeout with no votes treats both as next (both-skipped)', (t, done) => {
+  const v = new PostCallVoting();
+  v.openVoting('s-to2', 'alice', 'bob');
+  v.once('voting-closed', () => {
+    const result = v.getResult('s-to2');
+    assert.equal(result!.outcome, 'both-skipped');
+    assert.equal(result!.voteA, null);
+    assert.equal(result!.voteB, null);
+    done();
+  });
+}, { timeout: VOTING_WINDOW_MS + 2000 });
+
+test('PostCallVoting timeout with one heart emits vote-timeout for non-voter', (t, done) => {
+  const v = new PostCallVoting();
+  v.openVoting('s-to3', 'alice', 'bob');
+  v.castVote('s-to3', 'alice', 'heart');
+  v.once('vote-timeout', (sessionId: string, timedOutUserId: string) => {
+    assert.equal(sessionId, 's-to3');
+    assert.equal(timedOutUserId, 'bob');
+    done();
+  });
+}, { timeout: VOTING_WINDOW_MS + 2000 });
+
+test('PostCallVoting closeVoting manually closes a session', () => {
+  const v = makeVoting();
+  v.openVoting('s1', 'alice', 'bob');
+  v.closeVoting('s1');
+  assert.equal(v.isOpen('s1'), false);
+});
+
+// ─── getResult ────────────────────────────────────────────────────────────────
+
+test('PostCallVoting getResult returns pending for open session', () => {
+  const v = makeVoting();
+  v.openVoting('s1', 'alice', 'bob');
+  const result = v.getResult('s1');
+  assert.equal(result!.outcome, 'pending');
+  assert.equal(result!.resolvedAt, null);
+});
+
+test('PostCallVoting getResult returns null for unknown session', () => {
+  const v = makeVoting();
+  assert.equal(v.getResult('nope'), null);
+});
+
+// ─── getStats ─────────────────────────────────────────────────────────────────
+
+test('PostCallVoting getStats returns zeros for unknown user', () => {
+  const v = makeVoting();
+  const stats = v.getStats('nobody');
+  assert.equal(stats.totalCalls, 0);
+  assert.equal(stats.mutualMatches, 0);
+  assert.equal(stats.matchRate, 0);
+});
+
+test('PostCallVoting getStats counts mutual matches correctly', () => {
+  const v = makeVoting();
+  v.openVoting('s1', 'alice', 'bob');
+  v.castVote('s1', 'alice', 'heart');
+  v.castVote('s1', 'bob', 'heart');
+
+  v.openVoting('s2', 'alice', 'charlie');
+  v.castVote('s2', 'alice', 'next');
+  v.castVote('s2', 'charlie', 'next');
+
+  const stats = v.getStats('alice');
+  assert.equal(stats.totalCalls, 2);
+  assert.equal(stats.mutualMatches, 1);
+  assert.equal(stats.heartsGiven, 1);
+  assert.equal(stats.heartsReceived, 1);
+  assert.ok(Math.abs(stats.matchRate - 50) < 0.01);
+});
+
+test('PostCallVoting getStats matchRate is 0 when no mutual matches', () => {
+  const v = makeVoting();
+  v.openVoting('s1', 'alice', 'bob');
+  v.castVote('s1', 'alice', 'next');
+  v.castVote('s1', 'bob', 'next');
+  const stats = v.getStats('alice');
+  assert.equal(stats.matchRate, 0);
+});
+
+// ─── getVoteHistory ───────────────────────────────────────────────────────────
+
+test('PostCallVoting getVoteHistory returns all resolved results', () => {
+  const v = makeVoting();
+  v.openVoting('s1', 'a', 'b');
+  v.castVote('s1', 'a', 'heart');
+  v.castVote('s1', 'b', 'next');
+
+  v.openVoting('s2', 'c', 'd');
+  v.castVote('s2', 'c', 'next');
+  v.castVote('s2', 'd', 'next');
+
+  const history = v.getVoteHistory();
+  assert.equal(history.length, 2);
+});
+
+// ─── openSessionCount ─────────────────────────────────────────────────────────
+
+test('PostCallVoting openSessionCount increments and decrements', () => {
+  const v = makeVoting();
+  assert.equal(v.openSessionCount(), 0);
+  v.openVoting('s1', 'a', 'b');
+  v.openVoting('s2', 'c', 'd');
+  assert.equal(v.openSessionCount(), 2);
+  v.castVote('s1', 'a', 'next');
+  v.castVote('s1', 'b', 'next');
+  assert.equal(v.openSessionCount(), 1);
+});
+
+// ─── clear ────────────────────────────────────────────────────────────────────
+
+test('PostCallVoting clear removes all open sessions', () => {
+  const v = makeVoting();
+  v.openVoting('s1', 'a', 'b');
+  v.openVoting('s2', 'c', 'd');
+  v.clear();
+  assert.equal(v.openSessionCount(), 0);
+});
+
+test('PostCallVoting clear does not remove history', () => {
+  const v = makeVoting();
+  v.openVoting('s1', 'a', 'b');
+  v.castVote('s1', 'a', 'heart');
+  v.castVote('s1', 'b', 'heart');
+  v.clear();
+  assert.equal(v.getVoteHistory().length, 1);
 });

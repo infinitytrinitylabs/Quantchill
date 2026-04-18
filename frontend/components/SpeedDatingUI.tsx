@@ -1,138 +1,158 @@
 'use client';
 
-/**
- * SpeedDatingUI – the four-screen flow for Quantchill's 60-second speed-dating
- * roulette (issue #25 §4).
- *
- * Screens:
- *  1. QueueScreen     – pulsing "Finding someone…" with estimated wait.
- *  2. CountdownScreen – 10-second pre-call countdown with free-cancel + accept.
- *  3. CallScreen      – full-screen video with floating 60-s countdown ring,
- *                       10-s warning flash, quality indicator, end-call btn.
- *  4. PostCallScreen  – dramatic card reveal: mutual match, one-sided, or skip.
- *  5. StatsScreen     – matches today, total calls, match-rate percentage.
- *
- * The component is fully controlled: the parent page owns the network layer
- * (WebSocket to the signaling server) and pushes state in through props.
- * Internal state is limited to UI concerns (animations, elapsed timers).
- */
-
-import { useEffect, useMemo, useRef, useState, useCallback } from 'react';
+import { useEffect, useRef, useState, useCallback } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
-export type SpeedDatingPhase =
-  | 'idle'
-  | 'queued'
-  | 'countdown'
-  | 'in-call'
-  | 'voting'
-  | 'post-call'
-  | 'stats';
+/** The high-level screen shown inside SpeedDatingUI. */
+export type SpeedDatingScreen =
+  | 'queue'        // Waiting for a match
+  | 'countdown'    // 10-second countdown before the call
+  | 'call'         // Active 60-second speed date
+  | 'voting'       // Post-call 10-second voting window
+  | 'reveal'       // Dramatic result reveal
+  | 'stats';       // Personal stats page
 
-export type ConnectionQuality = 'good' | 'medium' | 'poor' | 'disconnected';
+/** Selectable themes for Theme Night. */
+export type SpeedDatingTheme =
+  | 'travel'
+  | 'music'
+  | 'tech'
+  | 'fitness'
+  | 'food'
+  | 'gaming'
+  | null;
 
-export type PostCallOutcome =
-  | { kind: 'mutual-match'; chatRoomId: string; partnerName: string }
-  | { kind: 'they-liked-you'; partnerName: string }
-  | { kind: 'you-liked-them'; partnerName: string }
-  | { kind: 'no-match'; partnerName: string }
-  | { kind: 'no-votes'; partnerName: string };
+/** Result of post-call voting. */
+export type VotingOutcome = 'mutual-match' | 'one-sided' | 'both-skipped' | null;
 
-export interface DailyStats {
-  matchesToday: number;
+/** User statistics. */
+export interface SpeedDatingStats {
   totalCalls: number;
-  /** 0-100. */
-  matchRatePercent: number;
-  /** Longest streak of mutual matches in a row today. */
-  bestStreak: number;
+  mutualMatches: number;
+  heartsGiven: number;
+  heartsReceived: number;
+  matchRate: number;
 }
 
 export interface SpeedDatingUIProps {
-  phase: SpeedDatingPhase;
-  /** Estimated ms until a partner is found. */
-  estimatedWaitMs?: number;
-  /** Number of people currently in the global queue. */
-  queueDepth?: number;
-  /** Remaining ms in the pre-call countdown (phase=countdown). */
-  countdownRemainingMs?: number;
-  /** Whether the user can still cancel without penalty. */
-  inFreeCancelWindow?: boolean;
-  /** Partner display name for the current match. */
-  partnerName?: string;
-  /** Partner age. */
-  partnerAge?: number;
-  /** Remote MediaStream (WebRTC, phase=in-call). */
+  /** Remote user's display name. */
+  remoteName?: string;
+  /** Remote user age (for display only). */
+  remoteAge?: number;
+  /** Remote MediaStream (WebRTC). */
   remoteStream?: MediaStream | null;
-  /** Local MediaStream for PiP self-view. */
+  /** Local MediaStream for self-view PiP. */
   localStream?: MediaStream | null;
-  /** Remaining ms in the 60-second call. */
-  callRemainingMs?: number;
-  /** Connection quality indicator. */
-  connectionQuality?: ConnectionQuality;
-  /** Remaining ms in the 10-second voting window. */
-  voteRemainingMs?: number;
-  /** Outcome to display on the post-call screen. */
-  postCallOutcome?: PostCallOutcome;
-  /** Stats for the StatsScreen. */
-  stats?: DailyStats;
-  /** True while a happy-hour event is active. */
+  /** Which screen is currently visible. Controlled externally. */
+  screen?: SpeedDatingScreen;
+  /** Seconds remaining in the countdown (0–10). */
+  countdownSeconds?: number;
+  /** Seconds remaining in the call (0–60). */
+  callSecondsRemaining?: number;
+  /** Seconds remaining in the voting window (0–10). */
+  votingSecondsRemaining?: number;
+  /** Result of the voting phase – available on reveal screen. */
+  votingOutcome?: VotingOutcome;
+  /** True when the other user liked the local user (for FOMO reveal). */
+  theyLikedYou?: boolean;
+  /** Estimated queue wait time in seconds. */
+  estimatedWaitSeconds?: number;
+  /** Currently selected theme. */
+  selectedTheme?: SpeedDatingTheme;
+  /** Stats for the stats page. */
+  stats?: SpeedDatingStats;
+  /** Whether Happy Hour is currently active. */
   happyHourActive?: boolean;
-  /** If set, displays "Theme: <theme>" on the queue screen. */
-  themeNight?: string;
-  /** Callback invoked when the user joins / leaves / votes / etc. */
-  onJoin?: () => void;
-  onLeave?: () => void;
-  onAccept?: () => void;
-  onCancel?: () => void;
-  onHangup?: () => void;
-  onVote?: (choice: 'heart' | 'skip') => void;
+  /** Theme Night label (e.g. "🎵 Music Night"). Null when inactive. */
+  themeNightLabel?: string | null;
+  // ── Callbacks ──────────────────────────────────────────────────────────────
+  onJoinQueue?: (theme: SpeedDatingTheme) => void;
+  onLeaveQueue?: () => void;
+  onCancelCountdown?: () => void;
+  onEndCall?: () => void;
+  onCastVote?: (vote: 'heart' | 'next') => void;
   onOpenStats?: () => void;
   onCloseStats?: () => void;
-  onStartChat?: (chatRoomId: string) => void;
-  onRequeue?: () => void;
 }
 
-// ─── Constants ───────────────────────────────────────────────────────────────
+// ─── Helpers ──────────────────────────────────────────────────────────────────
 
-const CALL_DURATION_MS = 60_000;
-const COUNTDOWN_DURATION_MS = 10_000;
-const VOTING_WINDOW_MS = 10_000;
+const CALL_DURATION_S = 60;
+const VOTING_DURATION_S = 10;
+const COUNTDOWN_DURATION_S = 10;
 
-const QUALITY_COLORS: Record<ConnectionQuality, string> = {
-  good: '#4ade80',
-  medium: '#facc15',
-  poor: '#f97316',
-  disconnected: '#ef4444'
-};
+const THEMES: { value: SpeedDatingTheme; label: string; emoji: string }[] = [
+  { value: null,      label: 'Any',     emoji: '🌍' },
+  { value: 'travel',  label: 'Travel',  emoji: '✈️' },
+  { value: 'music',   label: 'Music',   emoji: '🎵' },
+  { value: 'tech',    label: 'Tech',    emoji: '💻' },
+  { value: 'fitness', label: 'Fitness', emoji: '🏃' },
+  { value: 'food',    label: 'Food',    emoji: '🍕' },
+  { value: 'gaming',  label: 'Gaming',  emoji: '🎮' }
+];
 
-const QUALITY_LABELS: Record<ConnectionQuality, string> = {
-  good: 'Good',
-  medium: 'Fair',
-  poor: 'Poor',
-  disconnected: 'Lost'
-};
-
-// ─── Helpers ─────────────────────────────────────────────────────────────────
-
-function clampPct(n: number): number {
-  return Math.max(0, Math.min(100, n));
+/** Format seconds as M:SS. */
+function formatSeconds(s: number): string {
+  const m = Math.floor(s / 60);
+  const sec = s % 60;
+  return `${m}:${String(sec).padStart(2, '0')}`;
 }
 
-function formatSeconds(ms: number): string {
-  return Math.max(0, Math.ceil(ms / 1000)).toString();
+/** SVG circular progress ring. radius = 44, stroke = 8. */
+function ProgressRing({
+  value,
+  max,
+  size = 120,
+  strokeWidth = 8,
+  color = '#ec4899',
+  warningColor = '#ef4444',
+  warn = false
+}: {
+  value: number;
+  max: number;
+  size?: number;
+  strokeWidth?: number;
+  color?: string;
+  warningColor?: string;
+  warn?: boolean;
+}) {
+  const r = (size - strokeWidth) / 2;
+  const circumference = 2 * Math.PI * r;
+  const progress = Math.max(0, Math.min(1, value / max));
+  const dashOffset = circumference * (1 - progress);
+  const activeColor = warn ? warningColor : color;
+
+  return (
+    <svg width={size} height={size} className="-rotate-90">
+      {/* Track */}
+      <circle
+        cx={size / 2}
+        cy={size / 2}
+        r={r}
+        fill="none"
+        stroke="rgba(255,255,255,0.15)"
+        strokeWidth={strokeWidth}
+      />
+      {/* Progress */}
+      <circle
+        cx={size / 2}
+        cy={size / 2}
+        r={r}
+        fill="none"
+        stroke={activeColor}
+        strokeWidth={strokeWidth}
+        strokeLinecap="round"
+        strokeDasharray={circumference}
+        strokeDashoffset={dashOffset}
+        style={{ transition: 'stroke-dashoffset 0.8s linear, stroke 0.3s ease' }}
+      />
+    </svg>
+  );
 }
 
-function formatWait(ms: number): string {
-  const seconds = Math.max(0, Math.round(ms / 1000));
-  if (seconds < 60) return `${seconds}s`;
-  const m = Math.floor(seconds / 60);
-  const s = seconds % 60;
-  return `${m}m ${s}s`;
-}
-
-// ─── Sub-components ──────────────────────────────────────────────────────────
+// ─── VideoElement ─────────────────────────────────────────────────────────────
 
 function VideoElement({
   stream,
@@ -144,196 +164,46 @@ function VideoElement({
   className?: string;
 }) {
   const ref = useRef<HTMLVideoElement>(null);
+
   useEffect(() => {
     if (ref.current && stream) {
       ref.current.srcObject = stream;
     }
   }, [stream]);
-  return <video ref={ref} autoPlay playsInline muted={muted} className={className} />;
-}
 
-/** Circular countdown ring drawn with a single SVG stroke. */
-function CountdownRing({
-  progress,
-  size = 120,
-  stroke = 6,
-  color = '#22d3ee',
-  warning = false
-}: {
-  /** 0-1, where 1 = full ring. */
-  progress: number;
-  size?: number;
-  stroke?: number;
-  color?: string;
-  warning?: boolean;
-}) {
-  const r = (size - stroke) / 2;
-  const c = 2 * Math.PI * r;
-  const dash = c * clampPct(progress * 100) / 100;
   return (
-    <svg width={size} height={size} className={warning ? 'animate-pulse' : ''}>
-      <circle
-        cx={size / 2}
-        cy={size / 2}
-        r={r}
-        fill="none"
-        stroke="rgba(255,255,255,0.15)"
-        strokeWidth={stroke}
-      />
-      <circle
-        cx={size / 2}
-        cy={size / 2}
-        r={r}
-        fill="none"
-        stroke={warning ? '#ef4444' : color}
-        strokeWidth={stroke}
-        strokeDasharray={`${dash} ${c - dash}`}
-        strokeDashoffset={c / 4}
-        strokeLinecap="round"
-        style={{ transition: 'stroke-dasharray 0.2s linear' }}
-      />
-    </svg>
+    <video ref={ref} autoPlay playsInline muted={muted} className={className} />
   );
 }
 
-// ─── Screen: Queue ───────────────────────────────────────────────────────────
-
-function QueueScreen({
-  estimatedWaitMs = 0,
-  queueDepth = 0,
-  happyHourActive,
-  themeNight,
-  onLeave,
-  onOpenStats
-}: Pick<
-  SpeedDatingUIProps,
-  'estimatedWaitMs' | 'queueDepth' | 'happyHourActive' | 'themeNight' | 'onLeave' | 'onOpenStats'
->) {
-  const pulse = useMemo(
-    () => ({
-      animate: { scale: [1, 1.04, 1], opacity: [0.8, 1, 0.8] },
-      transition: { repeat: Infinity, duration: 1.6, ease: 'easeInOut' as const }
-    }),
-    []
-  );
-  return (
-    <div className="relative w-full h-full flex flex-col items-center justify-center bg-gradient-to-b from-indigo-900 via-fuchsia-900 to-black text-white">
-      {happyHourActive && (
-        <motion.div
-          initial={{ y: -20, opacity: 0 }}
-          animate={{ y: 0, opacity: 1 }}
-          className="absolute top-6 px-4 py-1.5 rounded-full bg-pink-500/80 text-sm font-semibold shadow-xl"
-        >
-          ✨ Happy Hour — 2× match rate
-        </motion.div>
-      )}
-      {themeNight && (
-        <div className="absolute top-20 text-xs uppercase tracking-widest text-white/70">
-          Theme: {themeNight}
-        </div>
-      )}
-
-      <motion.div {...pulse} className="relative mb-10">
-        <div className="w-48 h-48 rounded-full bg-gradient-to-br from-pink-500 to-violet-500 shadow-[0_0_120px_rgba(244,114,182,0.5)]" />
-        <div className="absolute inset-0 flex items-center justify-center text-5xl">💫</div>
-      </motion.div>
-
-      <h1 className="text-3xl font-bold mb-2">Finding someone…</h1>
-      <p className="text-white/60">
-        {queueDepth > 0 ? `${queueDepth} people online • ` : ''}~{formatWait(estimatedWaitMs)}
-      </p>
-
-      <div className="absolute bottom-10 inset-x-0 flex items-center justify-center gap-3">
-        <button
-          onClick={onLeave}
-          className="px-5 py-2 rounded-full bg-white/10 hover:bg-white/20 text-sm backdrop-blur-sm"
-        >
-          Leave queue
-        </button>
-        <button
-          onClick={onOpenStats}
-          className="px-5 py-2 rounded-full bg-white/10 hover:bg-white/20 text-sm backdrop-blur-sm"
-        >
-          📊 Stats
-        </button>
-      </div>
-    </div>
-  );
-}
-
-// ─── Screen: Countdown ───────────────────────────────────────────────────────
-
-function CountdownScreen({
-  partnerName = 'Someone',
-  partnerAge,
-  countdownRemainingMs = 0,
-  inFreeCancelWindow,
-  onAccept,
-  onCancel
-}: Pick<
-  SpeedDatingUIProps,
-  'partnerName' | 'partnerAge' | 'countdownRemainingMs' | 'inFreeCancelWindow' | 'onAccept' | 'onCancel'
->) {
-  const progress = countdownRemainingMs / COUNTDOWN_DURATION_MS;
-  const seconds = formatSeconds(countdownRemainingMs);
-  return (
-    <div className="relative w-full h-full flex flex-col items-center justify-center bg-gradient-to-br from-slate-900 to-indigo-950 text-white">
-      <p className="text-white/60 mb-3 uppercase tracking-widest text-xs">Match found</p>
-      <h2 className="text-4xl font-bold mb-1">{partnerName}</h2>
-      {typeof partnerAge === 'number' && <p className="text-white/50 mb-10">{partnerAge} years old</p>}
-
-      <div className="relative mb-10">
-        <CountdownRing progress={progress} size={160} stroke={8} color="#22d3ee" />
-        <div className="absolute inset-0 flex items-center justify-center text-5xl font-mono">{seconds}</div>
-      </div>
-
-      <div className="flex gap-4">
-        <motion.button
-          whileTap={{ scale: 0.95 }}
-          onClick={onCancel}
-          className={[
-            'px-6 py-3 rounded-full font-semibold',
-            inFreeCancelWindow ? 'bg-white/10 hover:bg-white/20' : 'bg-red-500/80 hover:bg-red-500'
-          ].join(' ')}
-        >
-          {inFreeCancelWindow ? 'Cancel' : 'Cancel (penalty)'}
-        </motion.button>
-        <motion.button
-          whileTap={{ scale: 0.95 }}
-          onClick={onAccept}
-          className="px-6 py-3 rounded-full bg-gradient-to-r from-pink-500 to-violet-500 font-semibold shadow-xl"
-        >
-          I&apos;m ready →
-        </motion.button>
-      </div>
-    </div>
-  );
-}
-
-// ─── Screen: Call ────────────────────────────────────────────────────────────
+// ─── SelfViewPiP ─────────────────────────────────────────────────────────────
 
 function SelfViewPiP({ localStream }: { localStream?: MediaStream | null }) {
   const [pos, setPos] = useState({ x: 0, y: 0 });
   const isDragging = useRef(false);
-  const start = useRef({ mx: 0, my: 0, px: 0, py: 0 });
+  const dragStart = useRef({ mx: 0, my: 0, px: 0, py: 0 });
 
   function onPointerDown(e: React.PointerEvent<HTMLDivElement>) {
     isDragging.current = true;
-    start.current = { mx: e.clientX, my: e.clientY, px: pos.x, py: pos.y };
+    dragStart.current = { mx: e.clientX, my: e.clientY, px: pos.x, py: pos.y };
     (e.currentTarget as HTMLDivElement).setPointerCapture(e.pointerId);
   }
+
   function onPointerMove(e: React.PointerEvent<HTMLDivElement>) {
     if (!isDragging.current) return;
     setPos({
-      x: start.current.px + (e.clientX - start.current.mx),
-      y: start.current.py + (e.clientY - start.current.my)
+      x: dragStart.current.px + (e.clientX - dragStart.current.mx),
+      y: dragStart.current.py + (e.clientY - dragStart.current.my)
     });
   }
-  function onPointerUp() { isDragging.current = false; }
+
+  function onPointerUp() {
+    isDragging.current = false;
+  }
 
   return (
     <div
-      className="absolute bottom-24 right-4 z-30 w-28 h-40 rounded-2xl overflow-hidden border-2 border-white/20 shadow-2xl bg-gray-900 cursor-grab active:cursor-grabbing"
+      className="absolute bottom-32 right-4 z-30 w-24 h-36 rounded-2xl overflow-hidden border-2 border-white/20 shadow-2xl bg-gray-900 cursor-grab active:cursor-grabbing"
       style={{ transform: `translate(${pos.x}px, ${pos.y}px)`, touchAction: 'none' }}
       onPointerDown={onPointerDown}
       onPointerMove={onPointerMove}
@@ -348,520 +218,828 @@ function SelfViewPiP({ localStream }: { localStream?: MediaStream | null }) {
   );
 }
 
-function CallScreen({
-  partnerName = 'Partner',
-  remoteStream,
-  localStream,
-  callRemainingMs = CALL_DURATION_MS,
-  connectionQuality = 'good',
-  onHangup
-}: Pick<
-  SpeedDatingUIProps,
-  'partnerName' | 'remoteStream' | 'localStream' | 'callRemainingMs' | 'connectionQuality' | 'onHangup'
->) {
-  const warning = callRemainingMs <= 10_000;
-  const progress = callRemainingMs / CALL_DURATION_MS;
-  const qualityColor = QUALITY_COLORS[connectionQuality];
-  const qualityLabel = QUALITY_LABELS[connectionQuality];
+// ─── Confetti ─────────────────────────────────────────────────────────────────
 
+const CONFETTI_PIECES = Array.from({ length: 32 }, (_, i) => ({
+  id: i,
+  x: Math.random() * 100,
+  delay: Math.random() * 0.8,
+  duration: 1.2 + Math.random() * 1.2,
+  color: ['#ec4899', '#a855f7', '#3b82f6', '#10b981', '#f59e0b', '#ef4444'][i % 6]!,
+  size: 8 + Math.random() * 8
+}));
+
+function Confetti() {
   return (
-    <div className="relative w-full h-full bg-black overflow-hidden">
-      {remoteStream ? (
-        <VideoElement stream={remoteStream} className="absolute inset-0 w-full h-full object-cover" />
-      ) : (
-        <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 text-white/60">
-          <div className="text-6xl animate-pulse">📡</div>
-          <p>Connecting to {partnerName}…</p>
-        </div>
-      )}
-
-      {/* Warning flash overlay */}
-      <AnimatePresence>
-        {warning && (
-          <motion.div
-            initial={{ opacity: 0 }}
-            animate={{ opacity: [0, 0.25, 0] }}
-            exit={{ opacity: 0 }}
-            transition={{ repeat: Infinity, duration: 1 }}
-            className="pointer-events-none absolute inset-0 bg-red-500 mix-blend-screen"
-          />
-        )}
-      </AnimatePresence>
-
-      {/* Top HUD */}
-      <div className="absolute top-0 inset-x-0 z-20 flex items-center justify-between px-5 py-4 bg-gradient-to-b from-black/60 to-transparent">
-        <span className="text-white font-semibold text-lg">{partnerName}</span>
-        <div className="relative">
-          <CountdownRing progress={progress} warning={warning} size={64} stroke={5} color="#22d3ee" />
-          <div className="absolute inset-0 flex items-center justify-center text-white font-mono text-sm">
-            {formatSeconds(callRemainingMs)}
-          </div>
-        </div>
-        <div className="flex items-center gap-1.5 px-3 py-1 rounded-full bg-black/40 backdrop-blur-sm">
-          <div
-            className="w-2.5 h-2.5 rounded-full"
-            style={{ backgroundColor: qualityColor, boxShadow: `0 0 6px ${qualityColor}` }}
-          />
-          <span className="text-white/70 text-xs">{qualityLabel}</span>
-        </div>
-      </div>
-
-      <SelfViewPiP localStream={localStream} />
-
-      {/* Bottom controls */}
-      <div className="absolute bottom-0 inset-x-0 z-20 flex items-center justify-center py-6 bg-gradient-to-t from-black/70 to-transparent">
-        <motion.button
-          whileTap={{ scale: 0.9 }}
-          onClick={onHangup}
-          className="w-16 h-16 rounded-full bg-red-500 flex items-center justify-center shadow-xl text-2xl border-2 border-red-400"
-          aria-label="End call"
-        >
-          📵
-        </motion.button>
-      </div>
-    </div>
-  );
-}
-
-// ─── Screen: Voting ──────────────────────────────────────────────────────────
-
-function VotingScreen({
-  partnerName = 'Partner',
-  voteRemainingMs = VOTING_WINDOW_MS,
-  onVote
-}: Pick<SpeedDatingUIProps, 'partnerName' | 'voteRemainingMs' | 'onVote'>) {
-  const [choice, setChoice] = useState<'heart' | 'skip' | null>(null);
-  const progress = voteRemainingMs / VOTING_WINDOW_MS;
-
-  function pick(c: 'heart' | 'skip') {
-    if (choice) return;
-    setChoice(c);
-    onVote?.(c);
-  }
-
-  return (
-    <div className="relative w-full h-full flex flex-col items-center justify-center bg-gradient-to-b from-slate-900 to-black text-white">
-      <p className="text-white/60 mb-2 uppercase tracking-widest text-xs">Did you vibe?</p>
-      <h2 className="text-3xl font-bold mb-6">{partnerName}</h2>
-
-      <div className="relative mb-8">
-        <CountdownRing progress={progress} size={80} stroke={5} color="#f472b6" />
-        <div className="absolute inset-0 flex items-center justify-center text-white font-mono">
-          {formatSeconds(voteRemainingMs)}
-        </div>
-      </div>
-
-      <div className="flex items-center gap-8">
-        <motion.button
-          whileHover={{ scale: 1.05 }}
-          whileTap={{ scale: 0.95 }}
-          onClick={() => pick('skip')}
-          className={[
-            'w-24 h-24 rounded-full flex items-center justify-center text-3xl shadow-xl',
-            choice === 'skip' ? 'bg-gray-500 ring-4 ring-white/40' : 'bg-white/10 border border-white/20'
-          ].join(' ')}
-          aria-label="Skip"
-        >
-          ➡️
-        </motion.button>
-        <motion.button
-          whileHover={{ scale: 1.08 }}
-          whileTap={{ scale: 0.92 }}
-          onClick={() => pick('heart')}
-          className={[
-            'w-28 h-28 rounded-full flex items-center justify-center text-4xl shadow-2xl',
-            choice === 'heart'
-              ? 'bg-gradient-to-br from-pink-500 to-rose-600 ring-4 ring-white/40'
-              : 'bg-gradient-to-br from-pink-500 to-rose-600'
-          ].join(' ')}
-          aria-label="Heart"
-        >
-          💗
-        </motion.button>
-      </div>
-
-      <p className="mt-8 text-white/40 text-sm">Both hearts = chat unlocked</p>
-    </div>
-  );
-}
-
-// ─── Screen: Post-call / Card Reveal ─────────────────────────────────────────
-
-function Confetti({ count = 60 }: { count?: number }) {
-  const pieces = useMemo(
-    () =>
-      Array.from({ length: count }).map((_, i) => ({
-        id: i,
-        x: Math.random() * 100,
-        delay: Math.random() * 0.4,
-        duration: 2 + Math.random() * 2,
-        color: ['#f472b6', '#22d3ee', '#facc15', '#a78bfa', '#4ade80'][i % 5]
-      })),
-    [count]
-  );
-  return (
-    <div className="pointer-events-none absolute inset-0 overflow-hidden">
-      {pieces.map((p) => (
+    <div className="pointer-events-none absolute inset-0 overflow-hidden z-50">
+      {CONFETTI_PIECES.map((p) => (
         <motion.div
           key={p.id}
-          initial={{ y: -20, x: `${p.x}%`, opacity: 0 }}
-          animate={{ y: '110vh', opacity: [0, 1, 1, 0], rotate: 360 }}
-          transition={{ duration: p.duration, delay: p.delay, ease: 'easeIn' }}
-          className="absolute w-2 h-3 rounded-sm"
-          style={{ backgroundColor: p.color, left: `${p.x}%` }}
+          className="absolute rounded-sm"
+          style={{
+            left: `${p.x}%`,
+            top: '-10px',
+            width: p.size,
+            height: p.size * 0.6,
+            backgroundColor: p.color
+          }}
+          initial={{ y: 0, opacity: 1, rotate: 0 }}
+          animate={{ y: '110vh', opacity: [1, 1, 0], rotate: 720 }}
+          transition={{ delay: p.delay, duration: p.duration, ease: 'easeIn' }}
         />
       ))}
     </div>
   );
 }
 
-function PostCallScreen({
-  postCallOutcome,
-  onStartChat,
-  onRequeue
-}: Pick<SpeedDatingUIProps, 'postCallOutcome' | 'onStartChat' | 'onRequeue'>) {
-  const content = useMemo(() => {
-    if (!postCallOutcome) return null;
-    switch (postCallOutcome.kind) {
-      case 'mutual-match':
-        return {
-          title: 'They liked you back!',
-          subtitle: `You and ${postCallOutcome.partnerName} matched`,
-          emoji: '🎉',
-          primary: 'Start chatting',
-          secondary: 'Next person'
-        };
-      case 'they-liked-you':
-        return {
-          title: `${postCallOutcome.partnerName} liked you!`,
-          subtitle: 'You passed — but they were into it. Keep going!',
-          emoji: '💫',
-          primary: 'Next person',
-          secondary: null as string | null
-        };
-      case 'you-liked-them':
-        return {
-          title: 'Not this time',
-          subtitle: `${postCallOutcome.partnerName} was not feeling it — but plenty more ahead.`,
-          emoji: '💪',
-          primary: 'Next person',
-          secondary: null as string | null
-        };
-      case 'no-match':
-        return {
-          title: 'Keep going!',
-          subtitle: `You and ${postCallOutcome.partnerName} both skipped. On to the next.`,
-          emoji: '➡️',
-          primary: 'Next person',
-          secondary: null as string | null
-        };
-      case 'no-votes':
-      default:
-        return {
-          title: 'Time ran out',
-          subtitle: 'Neither of you voted in time.',
-          emoji: '⏰',
-          primary: 'Next person',
-          secondary: null as string | null
-        };
-    }
-  }, [postCallOutcome]);
+// ─── QueueScreen ──────────────────────────────────────────────────────────────
 
-  if (!postCallOutcome || !content) return null;
-  const isMatch = postCallOutcome.kind === 'mutual-match';
-  const isFomo = postCallOutcome.kind === 'they-liked-you';
-  const { title, subtitle, emoji, primary, secondary } = content;
-
-  const gradient = isMatch
-    ? 'from-pink-500 via-fuchsia-500 to-violet-600'
-    : isFomo
-      ? 'from-amber-500 via-rose-500 to-pink-600'
-      : 'from-slate-700 to-slate-900';
-
-  function primaryAction() {
-    if (postCallOutcome && postCallOutcome.kind === 'mutual-match') {
-      onStartChat?.(postCallOutcome.chatRoomId);
-      return;
-    }
-    onRequeue?.();
-  }
-
-  return (
-    <div className={`relative w-full h-full flex items-center justify-center bg-gradient-to-br ${gradient} text-white overflow-hidden`}>
-      {isMatch && <Confetti />}
-      <motion.div
-        initial={{ scale: 0.7, opacity: 0, rotateX: -40 }}
-        animate={{ scale: 1, opacity: 1, rotateX: 0 }}
-        transition={{ type: 'spring', stiffness: 180, damping: 18 }}
-        className="relative z-10 max-w-sm w-full mx-6 rounded-3xl bg-black/30 border border-white/15 backdrop-blur-xl p-8 text-center shadow-2xl"
-      >
-        <div className="text-6xl mb-4" aria-hidden>{emoji}</div>
-        <h2 className="text-2xl font-bold mb-2">{title}</h2>
-        <p className="text-white/80 mb-6">{subtitle}</p>
-        <button
-          onClick={primaryAction}
-          className="w-full py-3 rounded-full bg-white text-slate-900 font-semibold shadow-xl hover:bg-white/90"
-        >
-          {primary}
-        </button>
-        {secondary && (
-          <button
-            onClick={onRequeue}
-            className="w-full py-2 mt-3 rounded-full bg-white/10 hover:bg-white/20 text-sm"
-          >
-            {secondary}
-          </button>
-        )}
-      </motion.div>
-    </div>
-  );
+interface QueueScreenProps {
+  estimatedWaitSeconds?: number;
+  selectedTheme: SpeedDatingTheme;
+  happyHourActive?: boolean;
+  themeNightLabel?: string | null;
+  onThemeChange: (theme: SpeedDatingTheme) => void;
+  onJoin: () => void;
+  onOpenStats?: () => void;
 }
 
-// ─── Screen: Stats ───────────────────────────────────────────────────────────
-
-function StatsScreen({ stats, onCloseStats }: Pick<SpeedDatingUIProps, 'stats' | 'onCloseStats'>) {
-  const s = stats ?? { matchesToday: 0, totalCalls: 0, matchRatePercent: 0, bestStreak: 0 };
-  const cards = [
-    { label: 'Matches today', value: s.matchesToday, emoji: '💗' },
-    { label: 'Total calls', value: s.totalCalls, emoji: '📞' },
-    { label: 'Match rate', value: `${clampPct(s.matchRatePercent).toFixed(0)}%`, emoji: '🎯' },
-    { label: 'Best streak', value: s.bestStreak, emoji: '🔥' }
-  ];
-  return (
-    <div className="relative w-full h-full bg-gradient-to-b from-slate-950 to-black text-white p-6">
-      <div className="flex items-center justify-between mb-6">
-        <h2 className="text-2xl font-bold">Your stats</h2>
-        <button
-          onClick={onCloseStats}
-          className="w-9 h-9 rounded-full bg-white/10 hover:bg-white/20 flex items-center justify-center"
-          aria-label="Close stats"
-        >
-          ✕
-        </button>
-      </div>
-      <div className="grid grid-cols-2 gap-4">
-        {cards.map((c) => (
-          <motion.div
-            key={c.label}
-            initial={{ y: 20, opacity: 0 }}
-            animate={{ y: 0, opacity: 1 }}
-            className="rounded-2xl bg-white/5 border border-white/10 p-5"
-          >
-            <div className="text-3xl mb-2">{c.emoji}</div>
-            <div className="text-3xl font-bold">{c.value}</div>
-            <div className="text-white/60 text-sm">{c.label}</div>
-          </motion.div>
-        ))}
-      </div>
-    </div>
-  );
-}
-
-// ─── Screen: Idle / entry ────────────────────────────────────────────────────
-
-function IdleScreen({
+function QueueScreen({
+  estimatedWaitSeconds,
+  selectedTheme,
   happyHourActive,
-  themeNight,
+  themeNightLabel,
+  onThemeChange,
   onJoin,
   onOpenStats
-}: Pick<SpeedDatingUIProps, 'happyHourActive' | 'themeNight' | 'onJoin' | 'onOpenStats'>) {
+}: QueueScreenProps) {
   return (
-    <div className="relative w-full h-full flex flex-col items-center justify-center bg-gradient-to-b from-indigo-950 via-fuchsia-950 to-black text-white">
-      <h1 className="text-4xl font-extrabold mb-1">Speed Dating</h1>
-      <p className="text-white/60 mb-8">60-second video roulette</p>
-      {happyHourActive && (
-        <div className="mb-3 px-4 py-1.5 rounded-full bg-pink-500/80 text-sm font-semibold">
-          ✨ Happy Hour is on — 2× match rate
-        </div>
-      )}
-      {themeNight && (
-        <div className="mb-6 text-xs uppercase tracking-widest text-white/70">Tonight&apos;s theme: {themeNight}</div>
-      )}
-      <motion.button
-        whileHover={{ scale: 1.04 }}
-        whileTap={{ scale: 0.96 }}
-        onClick={onJoin}
-        className="px-10 py-4 rounded-full bg-gradient-to-r from-pink-500 to-violet-500 font-bold text-lg shadow-2xl"
-      >
-        Start matching
-      </motion.button>
+    <div className="relative flex flex-col items-center justify-center h-full bg-gradient-to-b from-gray-950 via-gray-900 to-gray-950 px-6 gap-8">
+      {/* Stats button */}
       <button
         onClick={onOpenStats}
-        className="mt-6 px-4 py-2 rounded-full bg-white/10 hover:bg-white/20 text-sm"
+        className="absolute top-5 right-5 p-2.5 rounded-full bg-white/10 text-white text-xl hover:bg-white/20 transition"
+        aria-label="Open stats"
       >
-        📊 My stats
+        📊
+      </button>
+
+      {/* Header */}
+      <div className="text-center">
+        <h1 className="text-4xl font-bold text-white mb-1">Speed Dating</h1>
+        <p className="text-white/50 text-sm">60-second video calls. No pressure.</p>
+      </div>
+
+      {/* Happy Hour / Theme Night banners */}
+      <AnimatePresence>
+        {happyHourActive && (
+          <motion.div
+            initial={{ opacity: 0, y: -8 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: -8 }}
+            className="flex items-center gap-2 px-4 py-2 rounded-full bg-amber-500/20 border border-amber-500/40 text-amber-300 text-sm font-semibold"
+          >
+            ⚡ Happy Hour — 2× match rate until 10 PM
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      <AnimatePresence>
+        {themeNightLabel && (
+          <motion.div
+            initial={{ opacity: 0, y: -8 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: -8 }}
+            className="flex items-center gap-2 px-4 py-2 rounded-full bg-purple-500/20 border border-purple-500/40 text-purple-300 text-sm font-semibold"
+          >
+            🎭 {themeNightLabel}
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* Theme selector */}
+      <div className="w-full max-w-xs">
+        <p className="text-white/50 text-xs uppercase tracking-widest mb-3 text-center">
+          Choose a theme
+        </p>
+        <div className="grid grid-cols-4 gap-2">
+          {THEMES.map((t) => (
+            <button
+              key={String(t.value)}
+              onClick={() => onThemeChange(t.value)}
+              className={[
+                'flex flex-col items-center gap-1 p-2.5 rounded-2xl border text-xs transition-all',
+                selectedTheme === t.value
+                  ? 'bg-pink-500/20 border-pink-500 text-pink-300 scale-105'
+                  : 'bg-white/5 border-white/10 text-white/50 hover:bg-white/10'
+              ].join(' ')}
+            >
+              <span className="text-xl">{t.emoji}</span>
+              <span>{t.label}</span>
+            </button>
+          ))}
+        </div>
+      </div>
+
+      {/* Join button */}
+      <div className="flex flex-col items-center gap-3">
+        <motion.button
+          whileHover={{ scale: 1.05 }}
+          whileTap={{ scale: 0.95 }}
+          onClick={onJoin}
+          className="px-10 py-4 rounded-full bg-gradient-to-r from-pink-500 to-purple-600 text-white font-bold text-lg shadow-2xl shadow-pink-500/30 border border-white/10"
+        >
+          Find Someone ✨
+        </motion.button>
+
+        {estimatedWaitSeconds !== undefined && (
+          <p className="text-white/40 text-xs">
+            ~{estimatedWaitSeconds < 60
+              ? `${estimatedWaitSeconds}s`
+              : `${Math.round(estimatedWaitSeconds / 60)}m`} wait
+          </p>
+        )}
+      </div>
+
+      {/* How it works */}
+      <div className="w-full max-w-xs rounded-2xl bg-white/5 border border-white/10 p-4 text-center">
+        <p className="text-white/70 text-xs leading-relaxed">
+          You have <span className="text-white font-semibold">60 seconds</span> to vibe.
+          After the call, swipe <span className="text-pink-400">💗 Heart</span> or{' '}
+          <span className="text-white/50">👋 Next</span>. Match to chat!
+        </p>
+      </div>
+    </div>
+  );
+}
+
+// ─── WaitingScreen (in-queue) ─────────────────────────────────────────────────
+
+interface WaitingScreenProps {
+  estimatedWaitSeconds?: number;
+  selectedTheme: SpeedDatingTheme;
+  happyHourActive?: boolean;
+  onLeave: () => void;
+}
+
+function WaitingScreen({
+  estimatedWaitSeconds,
+  selectedTheme,
+  happyHourActive,
+  onLeave
+}: WaitingScreenProps) {
+  const theme = THEMES.find((t) => t.value === selectedTheme) ?? THEMES[0]!;
+
+  return (
+    <div className="relative flex flex-col items-center justify-center h-full bg-gradient-to-b from-gray-950 via-gray-900 to-gray-950 gap-8 px-6">
+      {/* Pulsing indicator */}
+      <div className="relative flex items-center justify-center">
+        {[1, 2, 3].map((i) => (
+          <motion.div
+            key={i}
+            className="absolute rounded-full border border-pink-500/40"
+            style={{ width: 60 + i * 40, height: 60 + i * 40 }}
+            animate={{ scale: [1, 1.08, 1], opacity: [0.4, 0.1, 0.4] }}
+            transition={{ duration: 2, delay: i * 0.4, repeat: Infinity, ease: 'easeInOut' }}
+          />
+        ))}
+        <div className="w-16 h-16 rounded-full bg-gradient-to-br from-pink-500 to-purple-600 flex items-center justify-center text-2xl shadow-xl shadow-pink-500/30">
+          {theme.emoji}
+        </div>
+      </div>
+
+      <div className="text-center">
+        <p className="text-white font-bold text-xl mb-1">Finding someone…</p>
+        {estimatedWaitSeconds !== undefined && (
+          <p className="text-white/40 text-sm">
+            Est. wait:{' '}
+            {estimatedWaitSeconds < 60
+              ? `${estimatedWaitSeconds}s`
+              : `${Math.round(estimatedWaitSeconds / 60)}m`}
+          </p>
+        )}
+      </div>
+
+      {happyHourActive && (
+        <div className="flex items-center gap-2 px-4 py-2 rounded-full bg-amber-500/20 border border-amber-500/40 text-amber-300 text-sm font-semibold">
+          ⚡ Happy Hour — higher match rate active
+        </div>
+      )}
+
+      <button
+        onClick={onLeave}
+        className="px-8 py-3 rounded-full bg-white/10 border border-white/10 text-white/60 text-sm hover:bg-white/20 transition"
+      >
+        Leave Queue
       </button>
     </div>
   );
 }
 
-// ─── Main component ──────────────────────────────────────────────────────────
+// ─── CountdownScreen ──────────────────────────────────────────────────────────
 
-export default function SpeedDatingUI(props: SpeedDatingUIProps) {
-  const {
-    phase,
-    estimatedWaitMs,
-    queueDepth,
-    countdownRemainingMs,
-    inFreeCancelWindow,
-    partnerName,
-    partnerAge,
-    remoteStream,
-    localStream,
-    callRemainingMs,
-    connectionQuality,
-    voteRemainingMs,
-    postCallOutcome,
-    stats,
-    happyHourActive,
-    themeNight,
-    onJoin,
-    onLeave,
-    onAccept,
-    onCancel,
-    onHangup,
-    onVote,
-    onOpenStats,
-    onCloseStats,
-    onStartChat,
-    onRequeue
-  } = props;
+interface CountdownScreenProps {
+  secondsRemaining: number;
+  remoteName: string;
+  onCancel: () => void;
+}
 
-  // Accessibility: announce phase changes to screen readers.
-  const liveRegion = useCallback(() => {
-    switch (phase) {
-      case 'queued':
-        return 'Searching for a match.';
-      case 'countdown':
-        return `Match found with ${partnerName ?? 'someone'}.`;
-      case 'in-call':
-        return 'Call in progress.';
-      case 'voting':
-        return 'Voting window open.';
-      case 'post-call':
-        if (postCallOutcome?.kind === 'mutual-match') return 'It is a mutual match.';
-        if (postCallOutcome?.kind === 'they-liked-you') return 'They liked you.';
-        return 'Call ended.';
-      case 'stats':
-        return 'Viewing stats.';
-      default:
-        return 'Ready to start matching.';
-    }
-  }, [phase, partnerName, postCallOutcome]);
+function CountdownScreen({ secondsRemaining, remoteName, onCancel }: CountdownScreenProps) {
+  const canCancel = secondsRemaining > COUNTDOWN_DURATION_S - 5;
 
   return (
-    <div className="fixed inset-0 w-full h-full">
-      <span className="sr-only" role="status" aria-live="polite">{liveRegion()}</span>
+    <div className="relative flex flex-col items-center justify-center h-full bg-gradient-to-b from-gray-950 to-gray-900 gap-8">
+      <p className="text-white/60 text-base">Get ready to meet</p>
+      <p className="text-white font-bold text-3xl">{remoteName}</p>
+
+      {/* Big countdown number */}
       <AnimatePresence mode="wait">
-        {phase === 'idle' && (
+        <motion.div
+          key={secondsRemaining}
+          initial={{ scale: 1.4, opacity: 0 }}
+          animate={{ scale: 1, opacity: 1 }}
+          exit={{ scale: 0.7, opacity: 0 }}
+          transition={{ duration: 0.35 }}
+          className="text-8xl font-bold text-white tabular-nums"
+          style={{ textShadow: '0 0 40px rgba(236,72,153,0.6)' }}
+        >
+          {secondsRemaining}
+        </motion.div>
+      </AnimatePresence>
+
+      <p className="text-white/40 text-sm">Starting soon…</p>
+
+      {canCancel && (
+        <button
+          onClick={onCancel}
+          className="px-7 py-2.5 rounded-full bg-white/10 border border-white/10 text-white/60 text-sm hover:bg-white/20 transition"
+        >
+          Cancel (free)
+        </button>
+      )}
+    </div>
+  );
+}
+
+// ─── CallScreen ───────────────────────────────────────────────────────────────
+
+interface CallScreenProps {
+  secondsRemaining: number;
+  remoteName: string;
+  remoteStream?: MediaStream | null;
+  localStream?: MediaStream | null;
+  onEndCall: () => void;
+}
+
+function CallScreen({
+  secondsRemaining,
+  remoteName,
+  remoteStream,
+  localStream,
+  onEndCall
+}: CallScreenProps) {
+  const [showControls, setShowControls] = useState(true);
+  const controlsTimer = useRef<ReturnType<typeof setTimeout>>(undefined);
+  const warn = secondsRemaining <= 10;
+
+  const resetControls = useCallback(() => {
+    setShowControls(true);
+    clearTimeout(controlsTimer.current);
+    controlsTimer.current = setTimeout(() => setShowControls(false), 4000);
+  }, []);
+
+  useEffect(() => {
+    resetControls();
+    return () => clearTimeout(controlsTimer.current);
+  }, [resetControls]);
+
+  return (
+    <div
+      className="relative w-full h-full bg-black overflow-hidden"
+      onClick={resetControls}
+      onPointerMove={resetControls}
+    >
+      {/* Warning flash overlay */}
+      <AnimatePresence>
+        {warn && (
           <motion.div
-            key="idle"
+            key="warn-flash"
             initial={{ opacity: 0 }}
-            animate={{ opacity: 1 }}
-            exit={{ opacity: 0 }}
-            className="absolute inset-0"
+            animate={{ opacity: [0, 0.25, 0] }}
+            transition={{ duration: 0.6, repeat: Infinity }}
+            className="absolute inset-0 z-40 pointer-events-none bg-red-500"
+          />
+        )}
+      </AnimatePresence>
+
+      {/* Remote video */}
+      {remoteStream ? (
+        <VideoElement
+          stream={remoteStream}
+          className="absolute inset-0 w-full h-full object-cover"
+        />
+      ) : (
+        <div className="absolute inset-0 flex flex-col items-center justify-center gap-4">
+          <div className="text-6xl animate-pulse">📡</div>
+          <p className="text-white/60 text-lg">Connecting to {remoteName}…</p>
+        </div>
+      )}
+
+      {/* Floating countdown ring – always visible */}
+      <div className="absolute top-5 left-1/2 -translate-x-1/2 z-30 flex items-center justify-center">
+        <ProgressRing
+          value={secondsRemaining}
+          max={CALL_DURATION_S}
+          size={80}
+          strokeWidth={6}
+          warn={warn}
+        />
+        <div className="absolute flex flex-col items-center">
+          <span
+            className={['text-xl font-bold tabular-nums', warn ? 'text-red-400' : 'text-white'].join(' ')}
           >
-            <IdleScreen
-              happyHourActive={happyHourActive}
-              themeNight={themeNight}
-              onJoin={onJoin}
-              onOpenStats={onOpenStats}
-            />
+            {secondsRemaining}
+          </span>
+          <span className="text-white/40 text-[9px]">sec</span>
+        </div>
+      </div>
+
+      {/* Name tag */}
+      <AnimatePresence>
+        {showControls && (
+          <motion.div
+            initial={{ opacity: 0, y: -10 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: -10 }}
+            className="absolute top-5 left-5 z-20 px-3 py-1 rounded-full bg-black/50 backdrop-blur-sm text-white text-sm font-semibold"
+          >
+            {remoteName}
           </motion.div>
         )}
-        {phase === 'queued' && (
+      </AnimatePresence>
+
+      {/* Self view */}
+      <SelfViewPiP localStream={localStream} />
+
+      {/* End call button */}
+      <AnimatePresence>
+        {showControls && (
           <motion.div
-            key="queued"
+            initial={{ opacity: 0, y: 20 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: 20 }}
+            className="absolute bottom-0 inset-x-0 z-20 flex items-center justify-center pb-safe-bottom py-6 bg-gradient-to-t from-black/70 to-transparent"
+          >
+            <motion.button
+              whileHover={{ scale: 1.08 }}
+              whileTap={{ scale: 0.92 }}
+              onClick={onEndCall}
+              className="w-16 h-16 rounded-full bg-red-500 flex items-center justify-center shadow-xl text-2xl border-2 border-red-400"
+              aria-label="End call"
+            >
+              📵
+            </motion.button>
+          </motion.div>
+        )}
+      </AnimatePresence>
+    </div>
+  );
+}
+
+// ─── VotingScreen ─────────────────────────────────────────────────────────────
+
+interface VotingScreenProps {
+  secondsRemaining: number;
+  remoteName: string;
+  onVote: (vote: 'heart' | 'next') => void;
+  myVote: 'heart' | 'next' | null;
+}
+
+function VotingScreen({ secondsRemaining, remoteName, onVote, myVote }: VotingScreenProps) {
+  return (
+    <div className="relative flex flex-col items-center justify-center h-full bg-gradient-to-b from-gray-950 via-gray-900 to-gray-950 gap-8 px-6">
+      <div className="text-center">
+        <p className="text-white/50 text-sm mb-1">Your call with {remoteName} ended</p>
+        <p className="text-white font-bold text-2xl">How did it go?</p>
+      </div>
+
+      {/* Voting timer ring */}
+      <div className="relative flex items-center justify-center">
+        <ProgressRing
+          value={secondsRemaining}
+          max={VOTING_DURATION_S}
+          size={100}
+          strokeWidth={7}
+          color="#a855f7"
+          warn={secondsRemaining <= 3}
+          warningColor="#ef4444"
+        />
+        <div className="absolute flex flex-col items-center">
+          <span className="text-2xl font-bold text-white tabular-nums">{secondsRemaining}</span>
+          <span className="text-white/40 text-[9px]">sec left</span>
+        </div>
+      </div>
+
+      {/* Vote buttons */}
+      <div className="flex gap-6">
+        {/* Heart */}
+        <motion.button
+          whileHover={{ scale: 1.1 }}
+          whileTap={{ scale: 0.88 }}
+          onClick={() => onVote('heart')}
+          disabled={myVote !== null}
+          className={[
+            'flex flex-col items-center gap-2 w-32 py-5 rounded-3xl border-2 transition-all',
+            myVote === 'heart'
+              ? 'bg-pink-500/20 border-pink-500 shadow-xl shadow-pink-500/30'
+              : myVote === 'next'
+              ? 'opacity-40 bg-white/5 border-white/10'
+              : 'bg-white/5 border-white/20 hover:bg-pink-500/10 hover:border-pink-500/60'
+          ].join(' ')}
+          aria-label="Heart – I liked them"
+        >
+          <span className="text-4xl">💗</span>
+          <span className="text-white font-semibold text-sm">Heart</span>
+        </motion.button>
+
+        {/* Next */}
+        <motion.button
+          whileHover={{ scale: 1.1 }}
+          whileTap={{ scale: 0.88 }}
+          onClick={() => onVote('next')}
+          disabled={myVote !== null}
+          className={[
+            'flex flex-col items-center gap-2 w-32 py-5 rounded-3xl border-2 transition-all',
+            myVote === 'next'
+              ? 'bg-white/15 border-white/40 shadow-xl'
+              : myVote === 'heart'
+              ? 'opacity-40 bg-white/5 border-white/10'
+              : 'bg-white/5 border-white/20 hover:bg-white/10 hover:border-white/30'
+          ].join(' ')}
+          aria-label="Next – move on"
+        >
+          <span className="text-4xl">👋</span>
+          <span className="text-white/70 font-semibold text-sm">Next</span>
+        </motion.button>
+      </div>
+
+      {myVote && (
+        <motion.p
+          initial={{ opacity: 0, y: 6 }}
+          animate={{ opacity: 1, y: 0 }}
+          className="text-white/50 text-sm"
+        >
+          {myVote === 'heart' ? 'Waiting to see if they liked you…' : 'Moving on…'}
+        </motion.p>
+      )}
+    </div>
+  );
+}
+
+// ─── RevealScreen ─────────────────────────────────────────────────────────────
+
+interface RevealScreenProps {
+  outcome: VotingOutcome;
+  theyLikedYou: boolean;
+  remoteName: string;
+  onFindNext: () => void;
+  onOpenChat?: () => void;
+}
+
+function RevealScreen({ outcome, theyLikedYou, remoteName, onFindNext, onOpenChat }: RevealScreenProps) {
+  const isMutual = outcome === 'mutual-match';
+  const isFomo = outcome === 'one-sided' && theyLikedYou;
+
+  return (
+    <div className="relative flex flex-col items-center justify-center h-full bg-gradient-to-b from-gray-950 via-gray-900 to-gray-950 gap-6 px-6 overflow-hidden">
+      {isMutual && <Confetti />}
+
+      {/* Card */}
+      <motion.div
+        initial={{ scale: 0.7, opacity: 0, rotateY: -25 }}
+        animate={{ scale: 1, opacity: 1, rotateY: 0 }}
+        transition={{ type: 'spring', stiffness: 160, damping: 18 }}
+        className={[
+          'w-full max-w-xs rounded-3xl border p-8 flex flex-col items-center gap-4 shadow-2xl',
+          isMutual
+            ? 'bg-gradient-to-b from-pink-950/60 to-purple-950/60 border-pink-500/40'
+            : isFomo
+            ? 'bg-gradient-to-b from-amber-950/60 to-orange-950/60 border-amber-500/40'
+            : 'bg-white/5 border-white/10'
+        ].join(' ')}
+      >
+        <span className="text-7xl">
+          {isMutual ? '🎉' : isFomo ? '💘' : '💪'}
+        </span>
+
+        <p className={[
+          'text-2xl font-bold text-center',
+          isMutual ? 'text-pink-300' : isFomo ? 'text-amber-300' : 'text-white'
+        ].join(' ')}>
+          {isMutual
+            ? "It's a match!"
+            : isFomo
+            ? `${remoteName} liked you!`
+            : 'Keep going!'}
+        </p>
+
+        <p className="text-white/50 text-sm text-center">
+          {isMutual
+            ? 'You both liked each other 💗 Chat is now open!'
+            : isFomo
+            ? "They liked you back — don't let them slip away 👀"
+            : 'There are plenty of people waiting to meet you.'}
+        </p>
+      </motion.div>
+
+      {/* Action buttons */}
+      <div className="flex flex-col gap-3 w-full max-w-xs">
+        {isMutual && onOpenChat && (
+          <motion.button
+            initial={{ opacity: 0, y: 10 }}
+            animate={{ opacity: 1, y: 0 }}
+            transition={{ delay: 0.4 }}
+            whileHover={{ scale: 1.04 }}
+            whileTap={{ scale: 0.96 }}
+            onClick={onOpenChat}
+            className="py-4 rounded-2xl bg-gradient-to-r from-pink-500 to-purple-600 text-white font-bold text-base shadow-lg shadow-pink-500/30 border border-white/10"
+          >
+            Open Chat 💬
+          </motion.button>
+        )}
+
+        <motion.button
+          initial={{ opacity: 0, y: 10 }}
+          animate={{ opacity: 1, y: 0 }}
+          transition={{ delay: isMutual ? 0.6 : 0.3 }}
+          whileHover={{ scale: 1.04 }}
+          whileTap={{ scale: 0.96 }}
+          onClick={onFindNext}
+          className="py-4 rounded-2xl bg-white/10 border border-white/10 text-white font-semibold text-base hover:bg-white/15 transition"
+        >
+          {isMutual ? 'Keep Meeting People' : 'Find Next Person ✨'}
+        </motion.button>
+      </div>
+    </div>
+  );
+}
+
+// ─── StatsScreen ─────────────────────────────────────────────────────────────
+
+interface StatsScreenProps {
+  stats: SpeedDatingStats;
+  onClose: () => void;
+}
+
+function StatsScreen({ stats, onClose }: StatsScreenProps) {
+  const matchRateColor =
+    stats.matchRate >= 50
+      ? 'text-green-400'
+      : stats.matchRate >= 25
+      ? 'text-amber-400'
+      : 'text-white/60';
+
+  return (
+    <div className="flex flex-col h-full bg-gradient-to-b from-gray-950 via-gray-900 to-gray-950">
+      {/* Header */}
+      <div className="flex items-center justify-between px-5 pt-safe-top py-4 border-b border-white/10">
+        <h2 className="text-white font-bold text-xl">Your Stats</h2>
+        <button
+          onClick={onClose}
+          className="p-2 rounded-full bg-white/10 text-white/70 hover:bg-white/20 transition"
+          aria-label="Close stats"
+        >
+          ✕
+        </button>
+      </div>
+
+      {/* Stats grid */}
+      <div className="flex-1 overflow-y-auto p-5 flex flex-col gap-4">
+        {/* Match Rate Hero */}
+        <div className="rounded-3xl bg-white/5 border border-white/10 p-6 flex flex-col items-center gap-2">
+          <p className="text-white/50 text-xs uppercase tracking-widest">Match Rate</p>
+          <p className={`text-6xl font-bold tabular-nums ${matchRateColor}`}>
+            {stats.matchRate.toFixed(0)}%
+          </p>
+          <p className="text-white/30 text-xs">
+            {stats.mutualMatches} match{stats.mutualMatches !== 1 ? 'es' : ''} from {stats.totalCalls} call{stats.totalCalls !== 1 ? 's' : ''}
+          </p>
+        </div>
+
+        {/* Stat cards */}
+        <div className="grid grid-cols-2 gap-3">
+          {[
+            { label: 'Total Calls', value: stats.totalCalls, emoji: '📞' },
+            { label: 'Matches Today', value: stats.mutualMatches, emoji: '💗' },
+            { label: 'Hearts Given', value: stats.heartsGiven, emoji: '💖' },
+            { label: 'Hearts Received', value: stats.heartsReceived, emoji: '🫀' }
+          ].map((item) => (
+            <div
+              key={item.label}
+              className="rounded-2xl bg-white/5 border border-white/10 p-4 flex flex-col gap-1"
+            >
+              <span className="text-2xl">{item.emoji}</span>
+              <p className="text-white font-bold text-2xl tabular-nums">{item.value}</p>
+              <p className="text-white/40 text-xs">{item.label}</p>
+            </div>
+          ))}
+        </div>
+
+        {/* Motivation footer */}
+        <div className="rounded-2xl bg-gradient-to-r from-pink-500/10 to-purple-500/10 border border-pink-500/20 p-4 text-center">
+          <p className="text-white/70 text-sm">
+            {stats.totalCalls === 0
+              ? 'Start your first speed date! 🚀'
+              : stats.matchRate >= 50
+              ? "You're a natural! Keep it up 🔥"
+              : stats.mutualMatches === 0
+              ? 'One great call can change everything 💫'
+              : 'Every call is a chance to connect ✨'}
+          </p>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── SpeedDatingUI ────────────────────────────────────────────────────────────
+
+/**
+ * SpeedDatingUI – top-level orchestration component for the Speed Dating
+ * mini-game.
+ *
+ * All timing and state are controlled by the parent (or a custom hook that
+ * wraps SpeedDatingQueue / SpeedCallManager / PostCallVoting).  This component
+ * is purely presentational.
+ */
+export default function SpeedDatingUI({
+  remoteName = 'Someone',
+  remoteAge,
+  remoteStream,
+  localStream,
+  screen = 'queue',
+  countdownSeconds = COUNTDOWN_DURATION_S,
+  callSecondsRemaining = CALL_DURATION_S,
+  votingSecondsRemaining = VOTING_DURATION_S,
+  votingOutcome = null,
+  theyLikedYou = false,
+  estimatedWaitSeconds,
+  selectedTheme: externalTheme,
+  stats = { totalCalls: 0, mutualMatches: 0, heartsGiven: 0, heartsReceived: 0, matchRate: 0 },
+  happyHourActive = false,
+  themeNightLabel = null,
+  onJoinQueue,
+  onLeaveQueue,
+  onCancelCountdown,
+  onEndCall,
+  onCastVote,
+  onOpenStats,
+  onCloseStats
+}: SpeedDatingUIProps) {
+  // Internal theme selection (can be lifted to parent via onJoinQueue arg).
+  const [internalTheme, setInternalTheme] = useState<SpeedDatingTheme>(null);
+  const selectedTheme = externalTheme !== undefined ? externalTheme : internalTheme;
+
+  // My current vote (local optimistic state).
+  const [myVote, setMyVote] = useState<'heart' | 'next' | null>(null);
+
+  // Reset my vote whenever we enter voting screen.
+  useEffect(() => {
+    if (screen === 'voting') setMyVote(null);
+  }, [screen]);
+
+  function handleVote(vote: 'heart' | 'next') {
+    if (myVote !== null) return;
+    setMyVote(vote);
+    onCastVote?.(vote);
+  }
+
+  const displayName = remoteAge ? `${remoteName}, ${remoteAge}` : remoteName;
+
+  return (
+    <div className="w-full h-full bg-gray-950 overflow-hidden">
+      <AnimatePresence mode="wait">
+        {/* Queue / pre-join screen */}
+        {screen === 'queue' && (
+          <motion.div
+            key="queue"
             initial={{ opacity: 0 }}
             animate={{ opacity: 1 }}
             exit={{ opacity: 0 }}
-            className="absolute inset-0"
+            className="w-full h-full"
           >
             <QueueScreen
-              estimatedWaitMs={estimatedWaitMs}
-              queueDepth={queueDepth}
+              estimatedWaitSeconds={estimatedWaitSeconds}
+              selectedTheme={selectedTheme}
               happyHourActive={happyHourActive}
-              themeNight={themeNight}
-              onLeave={onLeave}
+              themeNightLabel={themeNightLabel}
+              onThemeChange={setInternalTheme}
+              onJoin={() => onJoinQueue?.(selectedTheme)}
               onOpenStats={onOpenStats}
             />
           </motion.div>
         )}
-        {phase === 'countdown' && (
+
+        {/* Waiting-in-queue screen */}
+        {(screen as string) === 'waiting' && (
+          <motion.div
+            key="waiting"
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            className="w-full h-full"
+          >
+            <WaitingScreen
+              estimatedWaitSeconds={estimatedWaitSeconds}
+              selectedTheme={selectedTheme}
+              happyHourActive={happyHourActive}
+              onLeave={() => onLeaveQueue?.()}
+            />
+          </motion.div>
+        )}
+
+        {/* 10-second countdown */}
+        {screen === 'countdown' && (
           <motion.div
             key="countdown"
-            initial={{ opacity: 0, scale: 1.02 }}
+            initial={{ opacity: 0, scale: 0.95 }}
             animate={{ opacity: 1, scale: 1 }}
-            exit={{ opacity: 0 }}
-            className="absolute inset-0"
+            exit={{ opacity: 0, scale: 1.05 }}
+            className="w-full h-full"
           >
             <CountdownScreen
-              partnerName={partnerName}
-              partnerAge={partnerAge}
-              countdownRemainingMs={countdownRemainingMs}
-              inFreeCancelWindow={inFreeCancelWindow}
-              onAccept={onAccept}
-              onCancel={onCancel}
+              secondsRemaining={countdownSeconds}
+              remoteName={displayName}
+              onCancel={() => onCancelCountdown?.()}
             />
           </motion.div>
         )}
-        {phase === 'in-call' && (
+
+        {/* Active call */}
+        {screen === 'call' && (
           <motion.div
-            key="in-call"
+            key="call"
             initial={{ opacity: 0 }}
             animate={{ opacity: 1 }}
             exit={{ opacity: 0 }}
-            className="absolute inset-0"
+            className="w-full h-full"
           >
             <CallScreen
-              partnerName={partnerName}
+              secondsRemaining={callSecondsRemaining}
+              remoteName={displayName}
               remoteStream={remoteStream}
               localStream={localStream}
-              callRemainingMs={callRemainingMs}
-              connectionQuality={connectionQuality}
-              onHangup={onHangup}
+              onEndCall={() => onEndCall?.()}
             />
           </motion.div>
         )}
-        {phase === 'voting' && (
+
+        {/* Post-call voting */}
+        {screen === 'voting' && (
           <motion.div
             key="voting"
-            initial={{ opacity: 0, y: 20 }}
+            initial={{ opacity: 0, y: 30 }}
             animate={{ opacity: 1, y: 0 }}
-            exit={{ opacity: 0 }}
-            className="absolute inset-0"
+            exit={{ opacity: 0, y: -20 }}
+            className="w-full h-full"
           >
             <VotingScreen
-              partnerName={partnerName}
-              voteRemainingMs={voteRemainingMs}
-              onVote={onVote}
+              secondsRemaining={votingSecondsRemaining}
+              remoteName={displayName}
+              onVote={handleVote}
+              myVote={myVote}
             />
           </motion.div>
         )}
-        {phase === 'post-call' && (
+
+        {/* Dramatic reveal */}
+        {screen === 'reveal' && (
           <motion.div
-            key="post-call"
+            key="reveal"
             initial={{ opacity: 0 }}
             animate={{ opacity: 1 }}
             exit={{ opacity: 0 }}
-            className="absolute inset-0"
+            className="w-full h-full"
           >
-            <PostCallScreen
-              postCallOutcome={postCallOutcome}
-              onStartChat={onStartChat}
-              onRequeue={onRequeue}
+            <RevealScreen
+              outcome={votingOutcome}
+              theyLikedYou={theyLikedYou}
+              remoteName={displayName}
+              onFindNext={() => onJoinQueue?.(selectedTheme)}
             />
           </motion.div>
         )}
-        {phase === 'stats' && (
+
+        {/* Stats */}
+        {screen === 'stats' && (
           <motion.div
             key="stats"
-            initial={{ opacity: 0, y: 20 }}
-            animate={{ opacity: 1, y: 0 }}
-            exit={{ opacity: 0 }}
-            className="absolute inset-0"
+            initial={{ opacity: 0, x: 20 }}
+            animate={{ opacity: 1, x: 0 }}
+            exit={{ opacity: 0, x: -20 }}
+            className="w-full h-full"
           >
-            <StatsScreen stats={stats} onCloseStats={onCloseStats} />
+            <StatsScreen stats={stats} onClose={() => onCloseStats?.()} />
           </motion.div>
         )}
       </AnimatePresence>

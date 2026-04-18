@@ -1,349 +1,388 @@
 /**
- * PostCallVoting – collects hearts/skips from both participants after a
- * SpeedCallManager call ends, detects mutual matches, and emits rich
- * events for the UI / notification / analytics layers.
+ * PostCallVoting – post-call mutual match detection for the Speed Dating
+ * mini-game.
  *
- * Spec (issue #25 §3):
- *  - 10-second voting window starts the moment the call ends.
- *  - Each user casts exactly one vote: `heart` (match) or `skip`.
- *  - Both hearts → instant chat room opened, confetti, match notification.
- *  - Mismatch (one heart, one skip) → the heart-sender gets a
- *    "They liked you!" FOMO notification on the other user.
- *  - All voting records are persisted via a pluggable `ChemistryStore` so
- *    the Chemistry AI model can train on outcomes.
+ * After a 60-second call ends, both participants have a 10-second window to
+ * cast a vote:
  *
- * Design notes:
- *  - Voting ballots are one-shot per call; re-voting is rejected.
- *  - If the window times out and only one user voted, the non-voting user
- *    is treated as an implicit `skip` but we still record the voter's
- *    choice and deliver a FOMO notification if they hearted.
- *  - The service is deliberately light on its own state – it delegates to
- *    the store for anything long-lived.
+ *  - "heart"  → they want to match
+ *  - "next"   → skip, move on
+ *
+ * Outcome logic:
+ *  - Both heart  → mutual match: a chat room is opened and both users receive
+ *                  a confetti + match notification.
+ *  - One heart   → FOMO notification sent to the heartless voter:
+ *                  "They liked you!" to create anticipation.
+ *  - Both next   → quiet skip, no notification.
+ *
+ * All vote data is persisted in an in-memory store for later consumption by the
+ * Chemistry AI model (export via `getVoteHistory()`).
+ *
+ * Events emitted:
+ *  - `vote-cast`         (record: VoteRecord)
+ *  - `mutual-match`      (result: MutualMatchResult)
+ *  - `fomo-notification` (notification: FomoNotification)
+ *  - `vote-timeout`      (sessionId: string, timedOutUserId: string)
+ *  - `voting-closed`     (sessionId: string)
  */
 
 import { EventEmitter } from 'node:events';
 import { randomUUID } from 'node:crypto';
-import type { NowFn } from './SpeedDatingQueue';
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
+/** Duration of the voting window after call end (ms). */
 export const VOTING_WINDOW_MS = 10_000;
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
-export type VoteChoice = 'heart' | 'skip';
+/** A user's vote choice after the call. */
+export type VoteChoice = 'heart' | 'next';
 
-export interface Vote {
+/** A single vote cast by one user. */
+export interface VoteRecord {
+  sessionId: string;
   userId: string;
-  choice: VoteChoice;
+  vote: VoteChoice;
   castAt: number;
 }
 
-export interface BallotSnapshot {
-  ballotId: string;
-  callId: string;
-  userA: string;
-  userB: string;
+/** The final voting result for a session. */
+export interface VotingResult {
+  sessionId: string;
+  userAId: string;
+  userBId: string;
+  voteA: VoteChoice | null;
+  voteB: VoteChoice | null;
+  outcome: 'mutual-match' | 'one-sided' | 'both-skipped' | 'pending';
+  resolvedAt: number | null;
+}
+
+/** Emitted when both users heart — carries the new chat room ID. */
+export interface MutualMatchResult {
+  sessionId: string;
+  userAId: string;
+  userBId: string;
+  chatRoomId: string;
+  resolvedAt: number;
+}
+
+/** Emitted to the user who skipped when the other user hearted. */
+export interface FomoNotification {
+  sessionId: string;
+  recipientId: string;
+  admirerId: string;
+  message: string;
+  sentAt: number;
+}
+
+/** Internal state for a pending voting session. */
+interface VotingSession {
+  sessionId: string;
+  userAId: string;
+  userBId: string;
+  voteA: VoteChoice | null;
+  voteB: VoteChoice | null;
   openedAt: number;
-  closesAt: number;
+  timeoutHandle: ReturnType<typeof setTimeout>;
   closed: boolean;
-  votes: {
-    a: Vote | null;
-    b: Vote | null;
-  };
-  outcome: BallotOutcome | null;
-}
-
-/** The settled outcome of a voting round. */
-export type BallotOutcomeKind =
-  | 'mutual-match'
-  | 'one-sided-a-liked-b'
-  | 'one-sided-b-liked-a'
-  | 'double-skip'
-  | 'timeout-no-votes';
-
-export interface BallotOutcome {
-  kind: BallotOutcomeKind;
-  settledAt: number;
-  chatRoomId: string | null;
-  matchScore: number;
-}
-
-/** Record of a completed ballot – written to the store. */
-export interface ChemistryRecord {
-  ballotId: string;
-  callId: string;
-  userA: string;
-  userB: string;
-  openedAt: number;
-  closedAt: number;
-  outcome: BallotOutcome;
-  votes: Array<Pick<Vote, 'userId' | 'choice' | 'castAt'>>;
-}
-
-/** Pluggable persistence – in-memory by default. */
-export interface ChemistryStore {
-  save(record: ChemistryRecord): Promise<void> | void;
-  load(callId: string): Promise<ChemistryRecord | null> | ChemistryRecord | null;
-  count(): Promise<number> | number;
-}
-
-export class InMemoryChemistryStore implements ChemistryStore {
-  private readonly records = new Map<string, ChemistryRecord>();
-
-  save(record: ChemistryRecord): void {
-    this.records.set(record.callId, record);
-  }
-
-  load(callId: string): ChemistryRecord | null {
-    return this.records.get(callId) ?? null;
-  }
-
-  count(): number {
-    return this.records.size;
-  }
-
-  list(): ChemistryRecord[] {
-    return [...this.records.values()];
-  }
-}
-
-// ─── Configuration ────────────────────────────────────────────────────────────
-
-export interface PostCallVotingConfig {
-  store?: ChemistryStore;
-  votingWindowMs?: number;
-  nowFn?: NowFn;
-}
-
-export interface OpenBallotArgs {
-  callId: string;
-  userA: string;
-  userB: string;
-  callDurationMs: number;
 }
 
 // ─── PostCallVoting ───────────────────────────────────────────────────────────
 
-export class PostCallVoting extends EventEmitter {
-  private readonly store: ChemistryStore;
-  private readonly votingWindowMs: number;
-  private readonly nowFn: NowFn;
-
-  /** callId → ballot state. */
-  private readonly ballots = new Map<string, BallotSnapshot>();
-  /** userId → callId for fast lookup. */
-  private readonly userBallotIndex = new Map<string, string>();
-  /** callId → timeout handle. */
-  private readonly timers = new Map<string, ReturnType<typeof setTimeout>>();
-  /** The original call duration for outcome weighting. */
-  private readonly callDurations = new Map<string, number>();
-
-  constructor(config: PostCallVotingConfig = {}) {
-    super();
-    this.store = config.store ?? new InMemoryChemistryStore();
-    this.votingWindowMs = config.votingWindowMs ?? VOTING_WINDOW_MS;
-    this.nowFn = config.nowFn ?? (() => Date.now());
-  }
-
-  // ── Public API ──────────────────────────────────────────────────────────
-
-  /** Open a new voting ballot for a completed call. */
-  openBallot(args: OpenBallotArgs): BallotSnapshot {
-    if (this.ballots.has(args.callId)) {
-      throw new Error(`ballot already open for call ${args.callId}`);
-    }
-    if (args.userA === args.userB) {
-      throw new Error('ballot cannot have identical participants');
-    }
-    const now = this.nowFn();
-    const ballot: BallotSnapshot = {
-      ballotId: randomUUID(),
-      callId: args.callId,
-      userA: args.userA,
-      userB: args.userB,
-      openedAt: now,
-      closesAt: now + this.votingWindowMs,
-      closed: false,
-      votes: { a: null, b: null },
-      outcome: null
-    };
-    this.ballots.set(args.callId, ballot);
-    this.userBallotIndex.set(args.userA, args.callId);
-    this.userBallotIndex.set(args.userB, args.callId);
-    this.callDurations.set(args.callId, Math.max(0, args.callDurationMs));
-
-    const timer = setTimeout(() => this.close(args.callId, 'timeout'), this.votingWindowMs);
-    if (typeof timer === 'object' && timer && 'unref' in timer) {
-      (timer as { unref: () => void }).unref();
-    }
-    this.timers.set(args.callId, timer);
-
-    this.emit('ballot-opened', ballot);
-    return ballot;
-  }
-
-  /**
-   * Cast a vote.  Throws if the user is not part of an open ballot or has
-   * already voted.  Returns the updated ballot snapshot.
-   */
-  vote(userId: string, choice: VoteChoice): BallotSnapshot {
-    const callId = this.userBallotIndex.get(userId);
-    if (!callId) throw new Error(`no open ballot for user ${userId}`);
-    const ballot = this.ballots.get(callId);
-    if (!ballot || ballot.closed) throw new Error(`ballot closed for user ${userId}`);
-
-    const which: 'a' | 'b' = userId === ballot.userA ? 'a' : 'b';
-    if (ballot.votes[which] != null) {
-      throw new Error(`user ${userId} already voted`);
-    }
-
-    ballot.votes[which] = { userId, choice, castAt: this.nowFn() };
-    this.emit('vote-cast', { ballot, userId, choice });
-
-    if (ballot.votes.a && ballot.votes.b) {
-      // Both voted – settle immediately.
-      this.close(callId, 'both-voted');
-    }
-    return ballot;
-  }
-
-  /**
-   * Explicit close triggered by timeout or "both-voted".  Idempotent.
-   */
-  close(callId: string, reason: 'timeout' | 'both-voted' | 'abandoned'): BallotSnapshot | null {
-    const ballot = this.ballots.get(callId);
-    if (!ballot || ballot.closed) return ballot ?? null;
-
-    ballot.closed = true;
-    const timer = this.timers.get(callId);
-    if (timer) clearTimeout(timer);
-    this.timers.delete(callId);
-
-    const outcome = this.computeOutcome(ballot);
-    ballot.outcome = outcome;
-
-    this.userBallotIndex.delete(ballot.userA);
-    this.userBallotIndex.delete(ballot.userB);
-    this.ballots.delete(callId);
-
-    this.emit('ballot-closed', { ballot, reason, outcome });
-
-    if (outcome.kind === 'mutual-match') {
-      this.emit('mutual-match', {
-        ballot,
-        chatRoomId: outcome.chatRoomId!,
-        matchScore: outcome.matchScore
-      });
-    } else if (outcome.kind === 'one-sided-a-liked-b') {
-      this.emit('fomo-notification', {
-        ballot,
-        notifyUserId: ballot.userB,
-        fromUserId: ballot.userA
-      });
-    } else if (outcome.kind === 'one-sided-b-liked-a') {
-      this.emit('fomo-notification', {
-        ballot,
-        notifyUserId: ballot.userA,
-        fromUserId: ballot.userB
-      });
-    }
-
-    // Persist for Chemistry model training.
-    const record: ChemistryRecord = {
-      ballotId: ballot.ballotId,
-      callId: ballot.callId,
-      userA: ballot.userA,
-      userB: ballot.userB,
-      openedAt: ballot.openedAt,
-      closedAt: this.nowFn(),
-      outcome,
-      votes: [ballot.votes.a, ballot.votes.b]
-        .filter((v): v is Vote => v != null)
-        .map((v) => ({ userId: v.userId, choice: v.choice, castAt: v.castAt }))
-    };
-    void Promise.resolve(this.store.save(record));
-
-    this.callDurations.delete(callId);
-    return ballot;
-  }
-
-  /** Snapshot of a user's currently-open ballot, if any. */
-  getBallotForUser(userId: string): BallotSnapshot | null {
-    const callId = this.userBallotIndex.get(userId);
-    if (!callId) return null;
-    return this.ballots.get(callId) ?? null;
-  }
-
-  /** Number of currently-open ballots. */
-  openBallotCount(): number {
-    return this.ballots.size;
-  }
-
-  /** Underlying store – exposed for analytics dashboards. */
-  getStore(): ChemistryStore {
-    return this.store;
-  }
-
-  /** Testing / shutdown helper. */
-  shutdown(): void {
-    for (const callId of [...this.ballots.keys()]) {
-      this.close(callId, 'abandoned');
-    }
-  }
-
-  // ── Internals ───────────────────────────────────────────────────────────
-
-  private computeOutcome(ballot: BallotSnapshot): BallotOutcome {
-    const a = ballot.votes.a;
-    const b = ballot.votes.b;
-    const now = this.nowFn();
-    const callDurationMs = this.callDurations.get(ballot.callId) ?? 0;
-
-    // No votes at all.
-    if (!a && !b) {
-      return {
-        kind: 'timeout-no-votes',
-        settledAt: now,
-        chatRoomId: null,
-        matchScore: 0
-      };
-    }
-
-    // Treat a missing vote as an implicit skip.
-    const aChoice: VoteChoice = a?.choice ?? 'skip';
-    const bChoice: VoteChoice = b?.choice ?? 'skip';
-
-    if (aChoice === 'heart' && bChoice === 'heart') {
-      return {
-        kind: 'mutual-match',
-        settledAt: now,
-        chatRoomId: randomUUID(),
-        matchScore: scoreMatch(a!, b!, callDurationMs)
-      };
-    }
-    if (aChoice === 'heart' && bChoice === 'skip') {
-      return { kind: 'one-sided-a-liked-b', settledAt: now, chatRoomId: null, matchScore: 0 };
-    }
-    if (aChoice === 'skip' && bChoice === 'heart') {
-      return { kind: 'one-sided-b-liked-a', settledAt: now, chatRoomId: null, matchScore: 0 };
-    }
-    return { kind: 'double-skip', settledAt: now, chatRoomId: null, matchScore: 0 };
-  }
-}
-
-// ─── Helpers ──────────────────────────────────────────────────────────────────
-
 /**
- * Compute a 0-1 chemistry score for a mutual match.  Factors in:
- *  - How quickly both users hearted (fast decisions = higher chemistry).
- *  - Whether both users used most of the 60-second call (longer call → higher).
+ * PostCallVoting manages the 10-second voting window that follows each call.
+ *
+ * Inject `nowFn` to control time in tests.
  */
-export function scoreMatch(a: Vote, b: Vote, callDurationMs: number): number {
-  const decisionSpread = Math.abs(a.castAt - b.castAt);
-  // Faster decisions are better, up to an 8-second cap.
-  const decisionScore = Math.max(0, 1 - decisionSpread / 8_000);
-  // Longer calls are better (up to 60s).
-  const callScore = Math.min(1, callDurationMs / 60_000);
-  return Math.round((0.6 * decisionScore + 0.4 * callScore) * 100) / 100;
+export class PostCallVoting extends EventEmitter {
+  /** Active voting sessions keyed by sessionId. */
+  private readonly sessions = new Map<string, VotingSession>();
+
+  /** Completed voting results keyed by sessionId (permanent log). */
+  private readonly history = new Map<string, VotingResult>();
+
+  private readonly nowFn: () => number;
+
+  constructor(nowFn: () => number = Date.now) {
+    super();
+    this.nowFn = nowFn;
+  }
+
+  // ── Public API ───────────────────────────────────────────────────────────
+
+  /**
+   * Open a new voting session for a call that has just ended.
+   *
+   * The session automatically closes after `VOTING_WINDOW_MS` (10 s).
+   * Any votes not cast by then are treated as `null` (equivalent to "next"
+   * for outcome purposes).
+   *
+   * @returns The new sessionId (same as the call sessionId passed in).
+   */
+  openVoting(sessionId: string, userAId: string, userBId: string): string {
+    if (this.sessions.has(sessionId)) {
+      throw new Error(`Voting session ${sessionId} is already open.`);
+    }
+
+    const now = this.nowFn();
+
+    const timeoutHandle = setTimeout(() => {
+      this.closeVoting(sessionId);
+    }, VOTING_WINDOW_MS);
+
+    const session: VotingSession = {
+      sessionId,
+      userAId,
+      userBId,
+      voteA: null,
+      voteB: null,
+      openedAt: now,
+      timeoutHandle,
+      closed: false
+    };
+
+    this.sessions.set(sessionId, session);
+    return sessionId;
+  }
+
+  /**
+   * Cast a vote for a user in an open voting session.
+   *
+   * If both users have now voted, the session is resolved immediately without
+   * waiting for the timeout.
+   *
+   * Throws if:
+   *  - The session does not exist or is already closed.
+   *  - The userId is not a participant in the session.
+   *  - The user has already voted.
+   */
+  castVote(sessionId: string, userId: string, vote: VoteChoice): VoteRecord {
+    const session = this.sessions.get(sessionId);
+    if (!session) {
+      throw new Error(`No open voting session for id ${sessionId}.`);
+    }
+    if (session.closed) {
+      throw new Error(`Voting session ${sessionId} is already closed.`);
+    }
+
+    const isUserA = session.userAId === userId;
+    const isUserB = session.userBId === userId;
+    if (!isUserA && !isUserB) {
+      throw new Error(`User ${userId} is not a participant in session ${sessionId}.`);
+    }
+    if (isUserA && session.voteA !== null) {
+      throw new Error(`User ${userId} has already voted in session ${sessionId}.`);
+    }
+    if (isUserB && session.voteB !== null) {
+      throw new Error(`User ${userId} has already voted in session ${sessionId}.`);
+    }
+
+    const now = this.nowFn();
+    if (isUserA) {
+      session.voteA = vote;
+    } else {
+      session.voteB = vote;
+    }
+
+    const record: VoteRecord = { sessionId, userId, vote, castAt: now };
+    this.emit('vote-cast', record);
+
+    // Both votes in – resolve early.
+    if (session.voteA !== null && session.voteB !== null) {
+      this.resolveSession(session);
+    }
+
+    return record;
+  }
+
+  /**
+   * Force-close a voting session (called by the timeout or externally).
+   *
+   * Any uncast votes are treated as null (= "next").
+   */
+  closeVoting(sessionId: string): void {
+    const session = this.sessions.get(sessionId);
+    if (!session || session.closed) return;
+    this.resolveSession(session);
+  }
+
+  /**
+   * Return the voting result for a session (may still be pending if open).
+   */
+  getResult(sessionId: string): VotingResult | null {
+    // Check completed history first.
+    const historical = this.history.get(sessionId);
+    if (historical) return historical;
+
+    // Return a live pending snapshot.
+    const session = this.sessions.get(sessionId);
+    if (!session) return null;
+
+    return {
+      sessionId,
+      userAId: session.userAId,
+      userBId: session.userBId,
+      voteA: session.voteA,
+      voteB: session.voteB,
+      outcome: 'pending',
+      resolvedAt: null
+    };
+  }
+
+  /**
+   * Return whether a voting session is currently open.
+   */
+  isOpen(sessionId: string): boolean {
+    const session = this.sessions.get(sessionId);
+    return !!session && !session.closed;
+  }
+
+  /**
+   * Return the complete vote history (all resolved sessions).
+   *
+   * This slice of data is consumed by the Chemistry AI model.
+   */
+  getVoteHistory(): Readonly<VotingResult>[] {
+    return [...this.history.values()];
+  }
+
+  /**
+   * Return aggregate statistics across all resolved sessions.
+   *
+   * Useful for the Stats page shown to users.
+   */
+  getStats(userId: string): {
+    totalCalls: number;
+    mutualMatches: number;
+    heartsGiven: number;
+    heartsReceived: number;
+    matchRate: number;
+  } {
+    let totalCalls = 0;
+    let mutualMatches = 0;
+    let heartsGiven = 0;
+    let heartsReceived = 0;
+
+    for (const result of this.history.values()) {
+      const isUserA = result.userAId === userId;
+      const isUserB = result.userBId === userId;
+      if (!isUserA && !isUserB) continue;
+
+      totalCalls++;
+
+      const myVote = isUserA ? result.voteA : result.voteB;
+      const theirVote = isUserA ? result.voteB : result.voteA;
+
+      if (myVote === 'heart') heartsGiven++;
+      if (theirVote === 'heart') heartsReceived++;
+      if (result.outcome === 'mutual-match') mutualMatches++;
+    }
+
+    const matchRate = totalCalls > 0 ? (mutualMatches / totalCalls) * 100 : 0;
+    return { totalCalls, mutualMatches, heartsGiven, heartsReceived, matchRate };
+  }
+
+  /** Number of currently open voting sessions. */
+  openSessionCount(): number {
+    return this.sessions.size;
+  }
+
+  /**
+   * Clear all open voting sessions (useful for testing).
+   * Completed vote history is intentionally preserved so that the Chemistry AI
+   * model can consume it after a test tear-down.
+   */
+  clear(): void {
+    for (const session of this.sessions.values()) {
+      clearTimeout(session.timeoutHandle);
+    }
+    this.sessions.clear();
+  }
+
+  // ── Private helpers ───────────────────────────────────────────────────────
+
+  /**
+   * Resolve a session: compute outcome, store in history, emit events, and
+   * clean up state.
+   */
+  private resolveSession(session: VotingSession): void {
+    if (session.closed) return;
+    session.closed = true;
+    clearTimeout(session.timeoutHandle);
+    this.sessions.delete(session.sessionId);
+
+    const now = this.nowFn();
+
+    // Treat a null vote as "next".
+    const voteA = session.voteA ?? 'next';
+    const voteB = session.voteB ?? 'next';
+
+    // Emit timeout events for any user who did not vote.
+    if (session.voteA === null) {
+      this.emit('vote-timeout', session.sessionId, session.userAId);
+    }
+    if (session.voteB === null) {
+      this.emit('vote-timeout', session.sessionId, session.userBId);
+    }
+
+    // Determine outcome.
+    let outcome: VotingResult['outcome'];
+    if (voteA === 'heart' && voteB === 'heart') {
+      outcome = 'mutual-match';
+    } else if (voteA === 'next' && voteB === 'next') {
+      outcome = 'both-skipped';
+    } else {
+      outcome = 'one-sided';
+    }
+
+    const result: VotingResult = {
+      sessionId: session.sessionId,
+      userAId: session.userAId,
+      userBId: session.userBId,
+      voteA: session.voteA,
+      voteB: session.voteB,
+      outcome,
+      resolvedAt: now
+    };
+
+    this.history.set(session.sessionId, result);
+    this.emit('voting-closed', session.sessionId);
+
+    // Emit outcome-specific events.
+    if (outcome === 'mutual-match') {
+      const chatRoomId = randomUUID();
+      const matchResult: MutualMatchResult = {
+        sessionId: session.sessionId,
+        userAId: session.userAId,
+        userBId: session.userBId,
+        chatRoomId,
+        resolvedAt: now
+      };
+      this.emit('mutual-match', matchResult);
+    } else if (outcome === 'one-sided') {
+      // Determine which user hearted.
+      if (voteA === 'heart' && voteB === 'next') {
+        // A liked B, but B skipped.  Notify B (they might reconsider).
+        const fomo: FomoNotification = {
+          sessionId: session.sessionId,
+          recipientId: session.userBId,
+          admirerId: session.userAId,
+          message: 'Someone you just met liked you! 💘',
+          sentAt: now
+        };
+        this.emit('fomo-notification', fomo);
+      } else if (voteB === 'heart' && voteA === 'next') {
+        // B liked A, but A skipped.  Notify A.
+        const fomo: FomoNotification = {
+          sessionId: session.sessionId,
+          recipientId: session.userAId,
+          admirerId: session.userBId,
+          message: 'Someone you just met liked you! 💘',
+          sentAt: now
+        };
+        this.emit('fomo-notification', fomo);
+      }
+    }
+  }
 }
