@@ -299,6 +299,14 @@ export class MatchQueue {
     if (!a) return null;
     const b = this.findMatch(userId);
     if (!b) return null;
+
+    // Verify both users are still in queue before removing (race condition protection)
+    const aStillQueued = this.metadata.has(a.userId);
+    const bStillQueued = this.metadata.has(b.userId);
+    if (!aStillQueued || !bStillQueued) {
+      return null; // Another thread matched one of these users
+    }
+
     this.remove(a.userId);
     this.remove(b.userId);
     this.emitter.emit('match', { a, b, bracket: a.bracket });

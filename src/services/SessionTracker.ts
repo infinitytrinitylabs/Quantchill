@@ -31,6 +31,9 @@ export interface QuantchatSyncResult {
 
 export class SessionTracker {
   private readonly sessions = new Map<string, SessionState>();
+  private readonly SESSION_MAX_AGE_MS = 24 * 60 * 60 * 1000; // 24 hours
+  private lastCleanupMs = 0;
+  private readonly CLEANUP_INTERVAL_MS = 60 * 60 * 1000; // 1 hour
 
   /**
    * Create and register a new listening/watching session.
@@ -42,6 +45,9 @@ export class SessionTracker {
     mood: MoodName;
     isPremium: boolean;
   }): SessionState {
+    // Periodic cleanup of stale sessions
+    this.maybeCleanupStaleSessions();
+
     const state: SessionState = {
       sessionId: params.sessionId,
       userId: params.userId,
@@ -115,5 +121,25 @@ export class SessionTracker {
   getSession(sessionId: string): SessionState | null {
     const state = this.sessions.get(sessionId);
     return state ? { ...state } : null;
+  }
+
+  /**
+   * Clean up stale sessions that haven't been accessed in SESSION_MAX_AGE_MS.
+   * Called periodically to prevent memory leaks.
+   */
+  private maybeCleanupStaleSessions(): void {
+    const now = Date.now();
+    if (now - this.lastCleanupMs < this.CLEANUP_INTERVAL_MS) {
+      return;
+    }
+
+    this.lastCleanupMs = now;
+    const cutoff = now - this.SESSION_MAX_AGE_MS;
+
+    for (const [sessionId, state] of this.sessions.entries()) {
+      if (state.startedAt < cutoff) {
+        this.sessions.delete(sessionId);
+      }
+    }
   }
 }
