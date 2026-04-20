@@ -19,6 +19,13 @@ export interface ChillRoomFriend {
   frequency: string;
 }
 
+export interface RareConnectionMock {
+  id: string;
+  name: string;
+  compatibilityPercent: number;
+  context: string;
+}
+
 export const MOODS: Record<
   MoodState,
   { label: string; emoji: string; description: string; accentColor: string; bgGradient: string }
@@ -109,6 +116,13 @@ export const MOCK_FRIENDS: ChillRoomFriend[] = [
   { id: 'u3', name: 'Kai', avatar: '🌊', mood: 'sleep', frequency: 'Delta 2 Hz' },
   { id: 'u4', name: 'Nova', avatar: '🔮', mood: 'deep-focus', frequency: 'Beta 18 Hz' },
 ];
+
+export const RARE_CONNECTION_MOCK: RareConnectionMock = {
+  id: 'rare-nebula-17',
+  name: 'Mina · Lisbon',
+  compatibilityPercent: 94,
+  context: 'Outside your usual radius, high latent resonance in music + travel.'
+};
 
 export function formatDuration(seconds: number): string {
   const h = Math.floor(seconds / 3600);
