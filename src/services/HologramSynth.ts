@@ -62,6 +62,11 @@ const DEFAULT_OPTIONS: HologramSynthOptions = {
   pointStride: 3,
   depthScale: 1.5
 };
+const LUMINANCE_WEIGHT = 0.8;
+const TEMPORAL_GRADIENT_WEIGHT = 0.2;
+const SHADER_PULSE_FREQUENCY = 1.5;
+const SHADER_WAVE_FREQUENCY = 6.0;
+const SHADER_WAVE_AMPLITUDE = 0.02;
 
 function clamp(value: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, value));
@@ -94,13 +99,19 @@ export class HologramSynth {
 
     return frames.map((frame, frameIndex) => {
       validateFrame(frame);
+      // For the first frame there is no previous temporal sample, so we reuse
+      // the current frame and let temporalGradient resolve to zero.
       const previous = frames[Math.max(0, frameIndex - 1)];
       const depth = frame.luma.map((luma, i) => {
         const normalized = clamp(luma / 255, 0, 1);
         const prevLuma = previous?.luma?.[i] ?? luma;
         const temporalGradient = Math.abs(luma - prevLuma) / 255;
-        const edgeEnhanced = clamp(normalized * 0.8 + temporalGradient * 0.2, 0, 1);
-        return Number((1 - edgeEnhanced).toFixed(4));
+        const edgeEnhanced = clamp(
+          normalized * LUMINANCE_WEIGHT + temporalGradient * TEMPORAL_GRADIENT_WEIGHT,
+          0,
+          1
+        );
+        return 1 - edgeEnhanced;
       });
 
       return {
@@ -128,11 +139,11 @@ export class HologramSynth {
         for (let x = 0; x < map.width; x += this.options.pointStride) {
           const idx = y * map.width + x;
           const depth = map.depth[idx] ?? 0;
-          const intensity = Number((1 - depth).toFixed(4));
+          const intensity = 1 - depth;
           const point: Point3D = {
-            x: Number(((x - centerX) / Math.max(1, centerX)).toFixed(4)),
-            y: Number((((centerY - y) / Math.max(1, centerY))).toFixed(4)),
-            z: Number((depth * this.options.depthScale).toFixed(4)),
+            x: (x - centerX) / Math.max(1, centerX),
+            y: (centerY - y) / Math.max(1, centerY),
+            z: depth * this.options.depthScale,
             intensity,
             frameIndex
           };
@@ -171,7 +182,7 @@ export class HologramSynth {
         varying float vIntensity;
         void main() {
           vec3 animated = position;
-          animated.z += sin(uTime * 1.5 + position.x * 6.0) * 0.02 * uPulseStrength;
+          animated.z += sin(uTime * ${SHADER_PULSE_FREQUENCY} + position.x * ${SHADER_WAVE_FREQUENCY}) * ${SHADER_WAVE_AMPLITUDE} * uPulseStrength;
           vIntensity = intensity;
           gl_Position = vec4(animated, 1.0);
           gl_PointSize = 2.0 + intensity * 3.0;

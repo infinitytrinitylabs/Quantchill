@@ -18,8 +18,14 @@ test('HologramSynth extracts normalized depth maps from uploaded frames', () => 
 
   assert.equal(maps.length, 2);
   assert.equal(maps[0]?.depth.length, 16);
-  assert.ok((maps[0]?.depth[0] ?? 0) <= 0.25);
-  assert.ok((maps[1]?.depth[0] ?? 0) > 0.6);
+  const firstDepth = maps[0]?.depth[0] ?? 0;
+  const secondDepth = maps[1]?.depth[0] ?? 0;
+  // Frame 1 uses temporalGradient=0, so depth is 1 - (1.0*0.8 + 0*0.2) = 0.2.
+  const normalizedLuma = 64 / 255;
+  const temporalGradient = Math.abs(64 - 255) / 255;
+  const expectedSecondDepth = 1 - (normalizedLuma * 0.8 + temporalGradient * 0.2);
+  assert.ok(Math.abs(firstDepth - 0.2) < 1e-9);
+  assert.ok(Math.abs(secondDepth - expectedSecondDepth) < 1e-9);
 });
 
 test('HologramSynth constructs point cloud and bounds from depth maps', () => {

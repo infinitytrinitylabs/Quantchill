@@ -1,6 +1,9 @@
 export interface GyroscopeReading {
+  /** Raw device orientation angle around Z axis (degrees). */
   alpha: number;
+  /** Raw device orientation angle around X axis (degrees). */
   beta: number;
+  /** Raw device orientation angle around Y axis (degrees). */
   gamma: number;
   timestampMs: number;
 }
@@ -55,10 +58,14 @@ export class HologramViewer {
   }
 
   applyGyroscope(reading: GyroscopeReading): CameraOrbit {
+    // Quantchill viewer convention:
+    // - gamma (left/right tilt) steers horizontal orbit (yaw)
+    // - beta (front/back tilt) steers pitch
+    // - alpha (compass heading) is mapped to roll for subtle orientation response
     this.orbit = {
-      yawDeg: Number(clamp(reading.gamma, -90, 90).toFixed(3)),
-      pitchDeg: Number(clamp(reading.beta, -80, 80).toFixed(3)),
-      rollDeg: Number(clamp(reading.alpha, -180, 180).toFixed(3)),
+      yawDeg: clamp(reading.gamma, -90, 90),
+      pitchDeg: clamp(reading.beta, -80, 80),
+      rollDeg: clamp(reading.alpha, -180, 180),
       radius: this.orbit.radius,
       updatedAtMs: reading.timestampMs
     };
@@ -81,6 +88,8 @@ export class HologramViewer {
   }
 
   touch(point: TouchPoint): SpatialAudioSnippet | null {
+    // Input touch coordinates are expected in normalized screen space [0, 1].
+    // Convert them to hologram-space [-1, 1] with Y inverted to match scene axes.
     const normalizedTouchX = clamp(point.x, 0, 1) * 2 - 1;
     const normalizedTouchY = (1 - clamp(point.y, 0, 1)) * 2 - 1;
 

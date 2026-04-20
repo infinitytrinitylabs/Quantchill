@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { HologramViewer } from '../src/components/HologramViewer';
 
-test('HologramViewer maps gyroscope readings into camera orbit immediately', () => {
+test('HologramViewer clamps extreme gyroscope readings into camera orbit bounds', () => {
   const viewer = new HologramViewer();
   const orbit = viewer.applyGyroscope({
     alpha: 190,
@@ -15,6 +15,21 @@ test('HologramViewer maps gyroscope readings into camera orbit immediately', () 
   assert.equal(orbit.pitchDeg, -80);
   assert.equal(orbit.yawDeg, 90);
   assert.equal(orbit.updatedAtMs, 123);
+});
+
+test('HologramViewer preserves in-range gyroscope values without clamping drift', () => {
+  const viewer = new HologramViewer();
+  const orbit = viewer.applyGyroscope({
+    alpha: 45,
+    beta: -30,
+    gamma: 25,
+    timestampMs: 456
+  });
+
+  assert.equal(orbit.rollDeg, 45);
+  assert.equal(orbit.pitchDeg, -30);
+  assert.equal(orbit.yawDeg, 25);
+  assert.equal(orbit.updatedAtMs, 456);
 });
 
 test('HologramViewer transitions instantly when engagement drops below threshold', () => {
