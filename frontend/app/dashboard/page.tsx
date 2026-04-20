@@ -8,6 +8,7 @@ import { MOODS, TRACKS, MOCK_FRIENDS } from '@/lib/mockData';
 import MoodSelector from '@/components/MoodSelector';
 import AudioPlayer from '@/components/AudioPlayer';
 import ChillRoomLobby from '@/components/ChillRoomLobby';
+import SerendipityUI from '@/components/SerendipityUI';
 
 // Dynamic import for canvas-based visualizer (client-only)
 const AudioVisualizer = dynamic(
@@ -21,6 +22,12 @@ export default function DashboardPage() {
 
   const currentMood = MOODS[mood];
   const tracks = TRACKS[mood];
+  const rareConnection = {
+    id: 'rare-nebula-17',
+    name: 'Mina · Lisbon',
+    compatibilityPercent: 94,
+    context: 'Outside your usual radius, high latent resonance in music + travel.'
+  };
 
   const handleMoodChange = (next: MoodState) => {
     setMood(next);
@@ -103,6 +110,7 @@ export default function DashboardPage() {
             className="flex w-full max-w-sm flex-col gap-6"
           >
             <ChillRoomLobby friends={MOCK_FRIENDS} />
+            <SerendipityUI connection={rareConnection} />
 
             {/* Ecosystem sync badge */}
             <EcosystemBadge />
