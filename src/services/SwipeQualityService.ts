@@ -188,6 +188,9 @@ export class SwipeQualityService {
   private readonly superlikeQuota: number;
   private readonly now: () => number;
   private readonly settings?: SwipeQualityServiceOptions['settings'];
+  private lastCleanupMs = 0;
+  private readonly CLEANUP_INTERVAL_MS = 24 * 60 * 60 * 1000; // 24 hours
+  private readonly MAX_INACTIVE_DAYS = 30;
 
   constructor(options: SwipeQualityServiceOptions = {}) {
     this.superlikeQuota = options.superlikeQuota ?? DEFAULT_SUPERLIKE_QUOTA;
@@ -203,6 +206,13 @@ export class SwipeQualityService {
     if (observation.decisionTimeMs < 0 || !Number.isFinite(observation.decisionTimeMs)) {
       throw new Error('decisionTimeMs must be a non-negative finite number');
     }
+    if (!Number.isFinite(observation.timestamp) || observation.timestamp < 0) {
+      throw new Error('timestamp must be a non-negative finite number');
+    }
+
+    // Periodic cleanup
+    this.maybeCleanupInactiveUsers();
+
     const window = this.windows.get(userId) ?? [];
     window.push(observation);
     if (window.length > QUALITY_WINDOW_SIZE) {
@@ -267,7 +277,7 @@ export class SwipeQualityService {
   getDailyUsageSummary(userId: string): DailyUsageSummary {
     const bucket = this.getBucket(userId);
     const activeMinutes = this.computeActiveMinutes(bucket.observations);
-    const dailyLimit = this.settings?.get(userId).dailyTimeLimitMinutes ?? null;
+    const dailyLimit = this.settings?.get(userId)?.dailyTimeLimitMinutes ?? null;
 
     return {
       date: bucket.date,
@@ -310,5 +320,26 @@ export class SwipeQualityService {
     };
     this.daily.set(userId, fresh);
     return fresh;
+  }
+
+  /**
+   * Clean up inactive users to prevent memory leaks.
+   * Removes users whose last bucket is older than MAX_INACTIVE_DAYS.
+   */
+  private maybeCleanupInactiveUsers(): void {
+    const now = this.now();
+    if (now - this.lastCleanupMs < this.CLEANUP_INTERVAL_MS) {
+      return;
+    }
+
+    this.lastCleanupMs = now;
+    const cutoff = utcDateKey(new Date(now - this.MAX_INACTIVE_DAYS * 24 * 60 * 60 * 1000));
+
+    for (const [userId, bucket] of this.daily.entries()) {
+      if (bucket.date < cutoff) {
+        this.daily.delete(userId);
+        this.windows.delete(userId);
+      }
+    }
   }
 }

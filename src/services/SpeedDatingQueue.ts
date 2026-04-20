@@ -110,6 +110,9 @@ export class SpeedDatingQueue extends EventEmitter {
   /** userId → roomId of the countdown they are in. */
   private readonly userCountdownRoom: Map<string, string> = new Map();
 
+  private lastCleanupMs = 0;
+  private readonly CLEANUP_INTERVAL_MS = 300_000; // 5 minutes
+
   /**
    * Injectable clock (returns ms since epoch). Defaults to `Date.now`.
    * Pass a custom function in tests to control time without fake-timer
@@ -133,7 +136,15 @@ export class SpeedDatingQueue extends EventEmitter {
    * Throws if the user is currently in cooldown.
    */
   enqueue(userId: string, age: number, theme: SpeedDatingTheme = null): SpeedQueueEntry {
+    // Input validation
+    if (!Number.isInteger(age) || age < 18 || age > 120) {
+      throw new Error('Age must be an integer between 18 and 120');
+    }
+
     const now = this.nowFn();
+
+    // Periodic cleanup of expired cooldowns
+    this.maybeCleanupExpiredCooldowns(now);
 
     // Cooldown check.
     const cooldownExpiry = this.cooldowns.get(userId);
@@ -434,5 +445,22 @@ export class SpeedDatingQueue extends EventEmitter {
   private themeCompatible(a: SpeedDatingTheme, b: SpeedDatingTheme): boolean {
     if (a === null || b === null) return true;
     return a === b;
+  }
+
+  /**
+   * Clean up expired cooldowns to prevent memory leaks.
+   * Called periodically during enqueue operations.
+   */
+  private maybeCleanupExpiredCooldowns(now: number): void {
+    if (now - this.lastCleanupMs < this.CLEANUP_INTERVAL_MS) {
+      return;
+    }
+
+    this.lastCleanupMs = now;
+    for (const [userId, expiry] of this.cooldowns.entries()) {
+      if (now >= expiry) {
+        this.cooldowns.delete(userId);
+      }
+    }
   }
 }

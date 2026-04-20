@@ -103,6 +103,9 @@ export class PostCallVoting extends EventEmitter {
   private readonly history = new Map<string, VotingResult>();
 
   private readonly nowFn: () => number;
+  private lastCleanupMs = 0;
+  private readonly CLEANUP_INTERVAL_MS = 60 * 60 * 1000; // 1 hour
+  private readonly MAX_HISTORY_AGE_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
 
   constructor(nowFn: () => number = Date.now) {
     super();
@@ -124,6 +127,9 @@ export class PostCallVoting extends EventEmitter {
     if (this.sessions.has(sessionId)) {
       throw new Error(`Voting session ${sessionId} is already open.`);
     }
+
+    // Periodic cleanup
+    this.maybeCleanupStaleHistory();
 
     const now = this.nowFn();
 
@@ -382,6 +388,26 @@ export class PostCallVoting extends EventEmitter {
           sentAt: now
         };
         this.emit('fomo-notification', fomo);
+      }
+    }
+  }
+
+  /**
+   * Clean up stale voting history to prevent memory leaks.
+   * Removes sessions older than MAX_HISTORY_AGE_MS.
+   */
+  private maybeCleanupStaleHistory(): void {
+    const now = this.nowFn();
+    if (now - this.lastCleanupMs < this.CLEANUP_INTERVAL_MS) {
+      return;
+    }
+
+    this.lastCleanupMs = now;
+    const cutoff = now - this.MAX_HISTORY_AGE_MS;
+
+    for (const [sessionId, result] of this.history.entries()) {
+      if (result.resolvedAt && result.resolvedAt < cutoff) {
+        this.history.delete(sessionId);
       }
     }
   }
