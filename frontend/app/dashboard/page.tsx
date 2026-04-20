@@ -4,7 +4,7 @@ import { useState } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import dynamic from 'next/dynamic';
 import type { MoodState } from '@/lib/mockData';
-import { MOODS, TRACKS, MOCK_FRIENDS } from '@/lib/mockData';
+import { MOODS, TRACKS, MOCK_FRIENDS, RARE_CONNECTION_MOCK } from '@/lib/mockData';
 import MoodSelector from '@/components/MoodSelector';
 import AudioPlayer from '@/components/AudioPlayer';
 import ChillRoomLobby from '@/components/ChillRoomLobby';
@@ -22,12 +22,6 @@ export default function DashboardPage() {
 
   const currentMood = MOODS[mood];
   const tracks = TRACKS[mood];
-  const rareConnection = {
-    id: 'rare-nebula-17',
-    name: 'Mina · Lisbon',
-    compatibilityPercent: 94,
-    context: 'Outside your usual radius, high latent resonance in music + travel.'
-  };
 
   const handleMoodChange = (next: MoodState) => {
     setMood(next);
@@ -110,7 +104,7 @@ export default function DashboardPage() {
             className="flex w-full max-w-sm flex-col gap-6"
           >
             <ChillRoomLobby friends={MOCK_FRIENDS} />
-            <SerendipityUI connection={rareConnection} />
+            <SerendipityUI connection={RARE_CONNECTION_MOCK} />
 
             {/* Ecosystem sync badge */}
             <EcosystemBadge />

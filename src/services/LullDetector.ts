@@ -174,8 +174,12 @@ export class LullDetector {
 
   private prune(samples: ActivitySample[], nowMs: number): void {
     const cutoff = nowMs - this.options.historyWindowMs;
-    while (samples.length > 0 && samples[0]!.timestampMs < cutoff) {
-      samples.shift();
+    let firstValidIndex = 0;
+    while (firstValidIndex < samples.length && samples[firstValidIndex]!.timestampMs < cutoff) {
+      firstValidIndex += 1;
+    }
+    if (firstValidIndex > 0) {
+      samples.splice(0, firstValidIndex);
     }
   }
 }

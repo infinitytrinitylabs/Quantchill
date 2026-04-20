@@ -96,6 +96,11 @@ export class SerendipityAlgorithm {
   }
 }
 
+/**
+ * Computes cosine similarity between two latent feature vectors.
+ * Inputs are numeric vectors (possibly with different lengths); comparison
+ * uses the shared prefix length. Returns a normalized score in [0, 1].
+ */
 function cosineSimilarity(left: number[], right: number[]): number {
   const dimension = Math.min(left.length, right.length);
   if (dimension === 0) return 0;
